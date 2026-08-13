@@ -99,6 +99,15 @@ class Settings(BaseSettings):
     otp_max_attempts: int = 5
     otp_max_per_phone_per_hour: int = 3
 
+    #: Development bypass: when set, this code logs in ANY phone number.
+    #: Empty string disables it. The real OTP keeps working either way.
+    #:
+    #: This is an intentional, total authentication bypass, so it is guarded
+    #: three ways: it is config-driven (never hardcoded), the app REFUSES TO
+    #: START if it is set in production (see _enforce_production_rules), and
+    #: every use is logged as a warning.
+    otp_dev_bypass_code: str = ""
+
     # --- Search ------------------------------------------------------------
     default_search_radius_km: float = 25.0
     max_search_radius_km: float = 100.0
@@ -191,6 +200,12 @@ class Settings(BaseSettings):
             )
         if self.debug:
             raise ValueError("DEBUG must be false in production — it can leak internals")
+        if self.otp_dev_bypass_code:
+            raise ValueError(
+                "OTP_DEV_BYPASS_CODE must be empty in production. It is a complete "
+                "authentication bypass — any phone number could be logged into with "
+                "this code."
+            )
         if "*" in self.cors_origins_list:
             raise ValueError("CORS_ORIGINS must list explicit origins in production, never '*'")
         return self

@@ -13,15 +13,15 @@ the difference between a safe migration and a data-loss migration.
 """
 
 from app.db.base import Base
+from app.modules.auth.models import OtpRequest, RefreshToken
+from app.modules.users.models import User, UserRoleAssignment
 
-__all__ = ["Base"]
-
-# Feature models get imported here as they are built, e.g.
-#
-#     from app.modules.users.models import User
-#     from app.modules.providers.models import ProviderProfile
-#
-# and added to __all__ below so linters see them as intentionally re-exported
-# rather than unused imports.
-#
-# Next up: Phase 1 — the User model.
+# Listing them here marks the imports as intentional re-exports, so linters do
+# not flag them as unused.
+__all__ = [
+    "Base",
+    "OtpRequest",
+    "RefreshToken",
+    "User",
+    "UserRoleAssignment",
+]

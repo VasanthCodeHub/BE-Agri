@@ -13,11 +13,16 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
+from app.modules.auth.router import router as auth_router
+
 api_router = APIRouter()
 
-# Feature routers get mounted here as they are built:
-#
-# from app.modules.auth.router import router as auth_router
-# api_router.include_router(auth_router, prefix="/auth", tags=["auth"])
-#
-# Next up: Phase 1 — authentication.
+# One line per feature module. The `tags` value is what groups the endpoints
+# into a collapsible section in Swagger, so a module maps to a folder AND to a
+# section in the docs.
+api_router.include_router(auth_router, prefix="/auth", tags=["auth"])
+
+# Coming next:
+# api_router.include_router(users_router, prefix="/me", tags=["profile"])
+# api_router.include_router(vehicles_router, prefix="/provider", tags=["vehicles"])
+# api_router.include_router(search_router, prefix="/search", tags=["search"])

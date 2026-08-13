@@ -170,7 +170,9 @@ async def validation_error_handler(request: Request, exc: Exception) -> JSONResp
     ]
     log.info("validation_error", path=request.url.path, fields=fields)
     return error_response(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        # 422. Newer Starlette renamed the constant to ..._CONTENT; the literal
+        # avoids a deprecation warning while working on either version.
+        status_code=422,
         code="VALIDATION_ERROR",
         message="One or more fields are invalid.",
         request_id=_request_id(request),

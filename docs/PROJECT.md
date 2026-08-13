@@ -10,8 +10,8 @@
 | Stack | Python 3.11+ · FastAPI · PostgreSQL 16 + PostGIS · SQLAlchemy 2.0 async · Alembic |
 | Mobile client | Flutter (separate team) |
 | Environments | `local` · `production` |
-| Database | PostgreSQL **18** running locally, `agri_local`, migration `0001` applied ✅ |
-| Status | **Phase 0 complete** — foundation built and verified. Next: Phase 1 (auth) |
+| Database | PostgreSQL **18** running locally, `agri_local`, migrations at `73d129f5ac63` ✅ |
+| Status | **Phase 0 + Phase 1 complete** — login API working, 31 tests passing. Next: Phase 2 (profiles) |
 | Last updated | 2026-08-13 |
 
 ---
@@ -244,6 +244,51 @@ service code.
 builds), `ruff` for lint + format (replaces flake8 + black + isort), `mypy` for
 types, `pytest` + `httpx.AsyncClient` for tests, `pre-commit` to run them
 automatically.
+
+### ADR-014 — One phone number, multiple roles
+
+**Decision (client requirement, 2026-08-13):** a single user may hold both the
+RENTER and PROVIDER roles. Roles live in a `user_roles` table, not as a column
+on `users`, with `UNIQUE(user_id, role)`.
+
+Selecting a role the user does not yet hold at login **grants** it rather than
+rejecting the login. That is safe because the role by itself confers nothing —
+becoming a discoverable provider still requires a provider profile and admin
+verification.
+
+**Why a table rather than two booleans:** ADMIN returns in Phase 5, and adding
+a row beats adding a column. The unique constraint also makes "cannot hold the
+same role twice" a database guarantee rather than a code convention.
+
+**Constraint:** one **provider profile** per user — enforced in Phase 2 by a
+unique constraint on `provider_profiles.user_id`. A provider may still list
+multiple vehicles.
+
+**ADMIN is absent from the enum for now.** When it returns, the login endpoint
+must take a *narrower* input enum than the database stores, or a caller could
+self-assign ADMIN through an unauthenticated endpoint.
+
+### ADR-015 — Security side effects commit before raising
+
+**Decision:** the three places that write and then deliberately return an error
+call `repo.commit()` first: recording a failed OTP attempt, burning an
+exhausted OTP, and revoking a stolen token family.
+
+**Why:** `get_db` gives each request one transaction and rolls it back on any
+exception. That is correct for ordinary writes — it stops half-created records.
+But it silently discards writes made just before an error response.
+
+**This was found by testing, not by reading.** Both protections looked correct
+and did nothing:
+
+| Write | Then | Actual result |
+|---|---|---|
+| `attempts += 1` | raise `OTP_INVALID` | counter rolled back → **unlimited guesses at a 6-digit code** |
+| `revoke_family()` | raise `TOKEN_REUSED` | revocation rolled back → **stolen token still worked** |
+
+Both are covered by regression tests now (`test_wrong_code_decrements_remaining_attempts`,
+`test_reusing_a_rotated_token_revokes_the_whole_family`). The general lesson:
+**a security control that is never observed failing has not been verified.**
 
 ### ADR-013 — UUID primary keys
 
@@ -565,7 +610,7 @@ Building on these unless corrected. Each is a place the design could shift.
 | # | Assumption |
 |---|---|
 | A1 | Auth is phone + OTP; email is never a login credential. |
-| A2 | One person can hold both renter and provider roles on a single phone-number account. |
+| A2 | ✅ **Confirmed by client 2026-08-13:** one person holds both renter and provider roles on a single phone-number account, but only **one provider profile**. See ADR-014. |
 | A3 | Search returns providers as the primary card with vehicles nested; renter filters by vehicle type. *(See Q6 — leaning vehicle-centric.)* |
 | A4 | MVP availability is a simple `is_available` toggle — **no date/time calendar**. |
 | A5 | Price is indicative display only; no payments in MVP. |
@@ -635,21 +680,28 @@ Building on these unless corrected. Each is a place the design could shift.
 | ✅ | Test fixtures + 8 passing tests; ruff and mypy clean |
 | ✅ | `.pre-commit-config.yaml` |
 | ✅ | README + setup guide |
-| ⬜ | Install PostgreSQL + PostGIS locally, run `alembic upgrade head` |
+| ✅ | Install PostgreSQL locally, create `agri_local`, run `alembic upgrade head` |
+| ✅ | Git repository initialised and pushed to GitHub |
+| ⬜ | `uv run pre-commit install` (hooks are configured, not yet activated) |
+| ⬜ | Install PostGIS — **not needed until Phase 6**, see `docs/SETUP.md` §1.2 |
 | ⬜ | CI pipeline (deferred — Q20) |
 
-### Phase 1 — Authentication (next)  ⚠️ *real SMS needs Q2/Q3; fake adapter unblocks everything*
+### Phase 1 — Authentication ✅ COMPLETE
 | | Task |
 |---|---|
-| ⬜ | `users` model + migration, E.164 phone validation |
-| ⬜ | `otp_requests` model + migration |
-| ⬜ | SMS port + fake adapter (logs the OTP) |
-| ⬜ | OTP request/verify: hashing, expiry, attempt limits |
-| ⬜ | Rate limiter (in-process now, Redis later) applied to OTP routes |
-| ⬜ | `security.py`: JWT issue/verify, Argon2 hashing |
-| ⬜ | Refresh token rotation + reuse detection |
-| ⬜ | `get_current_user` / `require_role` dependencies |
-| ⬜ | Auth integration tests including abuse cases |
+| ✅ | `users` + `user_roles` models and migration |
+| ✅ | E.164 phone normalisation (`app/core/phone.py`) |
+| ✅ | `otp_requests` + `refresh_tokens` models and migration |
+| ✅ | SMS port + fake adapter (prints the OTP to the terminal) |
+| ✅ | OTP request/verify: Argon2 hashing, expiry, single use, attempt limits |
+| ✅ | Dev bypass code `000000`, blocked at startup in production |
+| ✅ | `security.py`: JWT issue/verify, Argon2, `secrets`-based token generation |
+| ✅ | Refresh token rotation + reuse detection + family revocation |
+| ✅ | `get_current_user`, `get_active_role`, `require_role` dependencies |
+| ✅ | 5 endpoints: otp/request, otp/verify, refresh, logout, me |
+| ✅ | 23 auth tests, incl. regression tests for the two rollback bugs |
+| ⬜ | Rate limiting — **deferred to production** by agreement (ADR-010) |
+| ⬜ | Real SMS vendor adapter — blocked on Q2/Q3 |
 
 ### Phase 2 — Profiles
 | | Task |
@@ -723,6 +775,14 @@ Building on these unless corrected. Each is a place the design could shift.
 | 2026-08-13 | **Phase 0 built:** config with production guardrails, structured logging with PII masking, error envelope, middleware, async DB layer, Alembic + PostGIS migration, health/readiness, app factory |
 | 2026-08-13 | Verified: 8 tests passing, `ruff check` clean, `mypy` clean, Alembic generates correct SQL |
 | 2026-08-13 | `README.md`, `.pre-commit-config.yaml`; docs updated to match decisions |
+| 2026-08-13 | PostgreSQL 18 installed; `agri` role + `agri_local` database created; migration `0001` applied (PostGIS skipped, not yet installed) |
+| 2026-08-13 | Decision: **no separate test database** — tests run against `agri_local` inside always-rolled-back transactions |
+| 2026-08-13 | Git repository initialised and pushed to <https://github.com/VasanthCodeHub/BE-Agri> (`.env` verified untracked) |
+| 2026-08-13 | Client decisions: ADMIN dropped for now; one phone = both roles (ADR-014); one provider profile per user; rate limiting deferred to production |
+| 2026-08-13 | **Phase 1 built:** 5 auth endpoints, 4 tables, phone normalisation, OTP with Argon2 + expiry + attempt limits, JWT access tokens, rotating refresh tokens with reuse detection, dev bypass code |
+| 2026-08-13 | Hand-corrected the autogenerated migration: missing `MetaData` import, enum created 3×, enums not dropped on downgrade. Verified with a downgrade/upgrade round-trip |
+| 2026-08-13 | **Found and fixed two security bugs by end-to-end testing** — OTP attempt counter and token-family revocation were both being rolled back (ADR-015). Regression tests added |
+| 2026-08-13 | 31 tests passing, ruff clean, mypy clean; test transactions verified to leave zero rows behind |
 
 ## 13. Pending work
 
@@ -750,3 +810,4 @@ provider earnings analytics.
 |---|---|
 | 2026-08-12 | Initial architecture proposal |
 | 2026-08-13 | Revised to two environments; ADR-010 revised (Redis deferred); ADR-007/008 marked deferred; ADR-013 added (UUID keys); Phase 0 completed and verified |
+| 2026-08-13 | ADR-014 added (one phone, multiple roles); ADR-015 added (security side effects commit before raising); assumption A2 confirmed; Phase 1 completed |
