@@ -1,0 +1,55 @@
+# Automatic checks that run before every commit.
+#
+# Activate once (after `git init`):
+#     uv run pre-commit install
+#
+# After that, `git commit` runs these automatically and blocks the commit if
+# anything fails. Why bother: a formatter that runs automatically ends all
+# formatting debate, and no commit ever mixes reformatting with real changes —
+# so diffs stay small and reviewable.
+
+repos:
+  # --- General file hygiene -------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+      # Refuses to commit a private key. Cheap insurance.
+      - id: detect-private-key
+
+  # --- Lint + format -------------------------------------------------------
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.2
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  # --- Local hooks ---------------------------------------------------------
+  - repo: local
+    hooks:
+      # Type check. Runs in our own venv so it sees the project's packages.
+      - id: mypy
+        name: mypy
+        entry: uv run mypy app
+        language: system
+        types: [python]
+        pass_filenames: false
+
+      # Last line of defence: never commit a real .env file.
+      # .gitignore already blocks it, but a `git add -f` would bypass that.
+      - id: block-env-files
+        name: block committing .env files
+        entry: >-
+          python -c "import sys;
+          bad=[f for f in sys.argv[1:] if f.split('/')[-1].startswith('.env')
+          and not f.endswith('.example')];
+          sys.exit('Refusing to commit secret file(s): '+', '.join(bad)) if bad else None"
+        language: system
+        files: ^\.env

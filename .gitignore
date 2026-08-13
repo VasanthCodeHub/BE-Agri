@@ -1,0 +1,44 @@
+# ---------------------------------------------------------------------------
+# SECRETS — the most important lines in this file.
+# Real .env files must NEVER be committed. Only *.example templates are.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+!.env.sit.example
+!.env.production.example
+*.pem
+*.key
+secrets/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# Local uploads (before S3 is wired up)
+media/
+uploads/
+RE
+# Logs
+*.log

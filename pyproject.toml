@@ -1,0 +1,112 @@
+[project]
+name = "agri-backend"
+version = "0.1.0"
+description = "Agri-Vehicle Rental App — backend API"
+requires-python = ">=3.11"
+
+dependencies = [
+    # --- Web framework -----------------------------------------------------
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",       # ASGI server that actually listens on a port
+    "python-multipart>=0.0.12",      # needed later for form/file uploads
+
+    # --- Validation & configuration ---------------------------------------
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",        # typed settings loaded from environment vars
+
+    # --- Database ----------------------------------------------------------
+    "sqlalchemy[asyncio]>=2.0.36",
+    "asyncpg>=0.30",                 # async PostgreSQL driver
+    "alembic>=1.14",                 # schema migrations
+    "geoalchemy2>=0.15",             # PostGIS column types for SQLAlchemy
+
+    # --- Security ----------------------------------------------------------
+    "pyjwt>=2.10",                   # JWT encode/decode
+    "argon2-cffi>=23.1",             # password hashing for admin accounts
+
+    # --- Observability -----------------------------------------------------
+    "structlog>=24.4",               # structured (JSON) logging
+
+    # --- Outbound HTTP (SMS / telephony vendors) --------------------------
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "pre-commit>=4.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+# ---------------------------------------------------------------------------
+# ruff — linter + formatter (replaces flake8 + black + isort)
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# Don't reformat the Python snippets inside our Markdown docs.
+extend-exclude = ["docs", "*.md"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes — real bugs (unused vars, undefined names)
+    "I",        # isort — import ordering
+    "N",        # pep8-naming
+    "UP",       # pyupgrade — modern syntax
+    "B",        # flake8-bugbear — likely bugs
+    "C4",       # comprehensions
+    "SIM",      # simplify
+    "ASYNC",    # async pitfalls — important for us, see ADR-005
+    "S",        # bandit — security issues
+    "RUF",
+]
+ignore = [
+    "S101",     # assert is fine (pytest uses it)
+    "B008",     # FastAPI's Depends() in argument defaults is the intended pattern
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S106"]        # hardcoded test credentials are fine
+"app/db/migrations/*" = ["E501"]    # generated migration lines can be long
+
+# ---------------------------------------------------------------------------
+# mypy — static type checking
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+warn_unused_configs = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["geoalchemy2.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "app.db.migrations.*"
+ignore_errors = true
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"               # no @pytest.mark.asyncio needed on every test
+addopts = "-ra --strict-markers"
+
+[tool.coverage.run]
+source = ["app"]
+omit = ["app/db/migrations/*"]
