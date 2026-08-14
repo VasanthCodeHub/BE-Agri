@@ -12,6 +12,7 @@ Two guarantees:
 
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 from functools import lru_cache
 
@@ -41,6 +42,13 @@ _PLACEHOLDER_SECRETS = frozenset(
 )
 
 _MIN_SECRET_LENGTH = 32
+
+#: SMS backends that exist. Anything else is a typo, and a typo that reaches
+#: production means no user can log in.
+_SMS_PROVIDERS = frozenset({"fake", "twilio"})
+
+#: A Twilio auth token is exactly 32 hex characters.
+_TWILIO_AUTH_TOKEN_PATTERN = re.compile(r"[0-9a-fA-F]{32}")
 
 
 class Settings(BaseSettings):
@@ -89,9 +97,33 @@ class Settings(BaseSettings):
     # --- Integrations ------------------------------------------------------
     #: "fake" needs no vendor account: the fake SMS provider logs the OTP to
     #: your terminal so you can log in locally, free, with no real messages.
+    #: "twilio" sends a real SMS — production only, and it costs money per
+    #: message, so it is never the default.
     sms_provider: str = "fake"
     #: "local" saves uploads to a folder on disk. Object storage comes later.
     storage_backend: str = "local"
+
+    # --- Twilio ------------------------------------------------------------
+    #: Only read when SMS_PROVIDER=twilio. Empty locally, which is why the
+    #: fields have defaults: a developer with no Twilio account must still be
+    #: able to boot the app.
+    twilio_account_sid: str = ""
+    twilio_auth_token: SecretStr = SecretStr("")
+    #: The Twilio number the OTP is sent FROM, in E.164. This is the number you
+    #: bought in the console under Phone Numbers > Manage > Active numbers.
+    twilio_phone_number: str = ""
+    #: Seconds to wait for Twilio before giving up. Kept short: the user is
+    #: staring at a spinner, and a slow send is better failed than hung.
+    twilio_timeout_seconds: float = 10.0
+
+    #: The SMS wording. Configuration rather than a literal because Indian DLT
+    #: rules require the delivered text to match a template registered with the
+    #: operator character for character — see integrations/sms/twilio.py.
+    #: `{code}` is required; `{minutes}` is optional.
+    sms_otp_template: str = (
+        "{code} is your verification code for Agri Vehicle Rental. "
+        "It expires in {minutes} minutes. Do not share it with anyone."
+    )
 
     # --- OTP policy --------------------------------------------------------
     #: 4 digits, matching what Indian users expect from most local apps. Only
@@ -171,12 +203,100 @@ class Settings(BaseSettings):
             )
         return value
 
+    @field_validator("sms_provider")
+    @classmethod
+    def _known_sms_provider(cls, value: str) -> str:
+        provider = value.strip().lower()
+        if provider not in _SMS_PROVIDERS:
+            raise ValueError(f"SMS_PROVIDER must be one of {sorted(_SMS_PROVIDERS)}, got {value!r}")
+        return provider
+
+    @field_validator("sms_otp_template")
+    @classmethod
+    def _usable_sms_template(cls, value: str) -> str:
+        """Fail at startup if the template cannot produce a message.
+
+        Without this, a stray brace or a missing `{code}` only shows up as a
+        crash — or worse, as an SMS with no code in it — on a real user's login.
+        """
+        if "{code}" not in value:
+            raise ValueError("SMS_OTP_TEMPLATE must contain the placeholder {code}")
+        try:
+            value.format(code="0000", minutes=5)
+        except (KeyError, IndexError, ValueError) as exc:
+            raise ValueError(
+                "SMS_OTP_TEMPLATE is not a valid template. Only {code} and "
+                f"{{minutes}} are available; literal braces must be doubled ({exc})"
+            ) from exc
+        return value
+
     @field_validator("otp_length")
     @classmethod
     def _sane_otp_length(cls, value: int) -> int:
         if not 4 <= value <= 8:
             raise ValueError(f"OTP_LENGTH must be between 4 and 8, got {value}")
         return value
+
+    @model_validator(mode="after")
+    def _require_twilio_credentials(self) -> Settings:
+        """If Twilio is selected, demand everything it needs — in any environment.
+
+        Checked at startup rather than on the first login attempt: a missing
+        credential should crash the deploy, not silently break OTP delivery for
+        every user until someone reads the logs.
+        """
+        if self.sms_provider != "twilio":
+            return self
+
+        missing: list[str] = []
+        if not self.twilio_account_sid:
+            missing.append("TWILIO_ACCOUNT_SID")
+        if not self.twilio_auth_token.get_secret_value():
+            missing.append("TWILIO_AUTH_TOKEN")
+        if not self.twilio_phone_number:
+            missing.append("TWILIO_PHONE_NUMBER")
+        if missing:
+            raise ValueError(
+                "SMS_PROVIDER=twilio requires: " + ", ".join(missing) + ". "
+                "Find the Account SID and Auth Token on the Twilio console dashboard."
+            )
+
+        if not self.twilio_account_sid.startswith("AC"):
+            raise ValueError(
+                "TWILIO_ACCOUNT_SID should start with 'AC' — a value starting "
+                "with 'SK' is an API key, not the Account SID."
+            )
+
+        # Both values sit side by side in the Twilio console and both are 34/32
+        # hex-ish characters, so copying the SID into both boxes is an easy slip.
+        # Twilio's own answer is a bare "20003 Authenticate" on the first send,
+        # which says nothing about the cause — so name it here instead.
+        token = self.twilio_auth_token.get_secret_value()
+        if token == self.twilio_account_sid or token.startswith("AC"):
+            raise ValueError(
+                "TWILIO_AUTH_TOKEN looks like the Account SID (it starts with "
+                "'AC'). The auth token is a separate value: on the Twilio console "
+                "dashboard, in the same Account Info panel, click 'Show' next to "
+                "Auth Token to reveal it."
+            )
+        # A Twilio auth token is exactly 32 lowercase hex characters. Anything
+        # else is a partial paste, a stray quote, or a different credential
+        # entirely — all of which look identical to a wrong password from here.
+        if not _TWILIO_AUTH_TOKEN_PATTERN.fullmatch(token):
+            raise ValueError(
+                "TWILIO_AUTH_TOKEN does not look like a Twilio auth token: it "
+                "must be exactly 32 hexadecimal characters (0-9, a-f). Got "
+                f"{len(token)} characters. Copy it from the Twilio console "
+                "dashboard > Account Info > Auth Token > Show, with no quotes "
+                "or spaces."
+            )
+
+        if not self.twilio_phone_number.startswith("+"):
+            raise ValueError(
+                "TWILIO_PHONE_NUMBER must be in E.164 form, e.g. +12025550123 "
+                f"(got {self.twilio_phone_number!r})"
+            )
+        return self
 
     @model_validator(mode="after")
     def _enforce_production_rules(self) -> Settings:
@@ -208,6 +328,12 @@ class Settings(BaseSettings):
                 "OTP_DEV_BYPASS_CODE must be empty in production. It is a complete "
                 "authentication bypass — any phone number could be logged into with "
                 "this code."
+            )
+        if self.sms_provider == "fake":
+            raise ValueError(
+                "SMS_PROVIDER=fake is not allowed in production — it logs the OTP "
+                "instead of sending it, so nobody could log in. Set "
+                "SMS_PROVIDER=twilio."
             )
         if "*" in self.cors_origins_list:
             raise ValueError("CORS_ORIGINS must list explicit origins in production, never '*'")

@@ -85,8 +85,9 @@ class OtpVerifyIn(BaseModel):
     phone: str = Field(..., examples=["9876543210"])
     code: str = Field(
         ...,
-        description="The code from the SMS. In local development the dev bypass "
-        "code also works for any number.",
+        description="The 4-digit code from the SMS. In local development it is "
+        "printed in the server terminal, and the dev bypass code (`0000`) works "
+        "for any number.",
         examples=["0000"],
     )
     name: str | None = Field(

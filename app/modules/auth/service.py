@@ -16,6 +16,7 @@ from app.core.config import Settings
 from app.core.exceptions import (
     BadRequestError,
     ForbiddenError,
+    ServiceUnavailableError,
     UnauthorizedError,
 )
 from app.core.logging import get_logger
@@ -30,7 +31,7 @@ from app.core.security import (
     utc_now,
     verify_otp,
 )
-from app.integrations.sms.base import SmsProvider
+from app.integrations.sms.base import SmsDeliveryError, SmsProvider
 from app.modules.auth.repository import AuthRepository
 from app.modules.auth.schemas import (
     LoginOut,
@@ -83,8 +84,20 @@ class AuthService:
         )
 
         # Delivery is the adapter's problem. Locally this prints to the
-        # terminal; in production it will hit a real gateway.
-        await self.sms.send_otp(phone_e164=phone_e164, code=code)
+        # terminal; in production it hits Twilio.
+        #
+        # Raising here is deliberate: the OTP row was created just above and
+        # `get_db` rolls the whole request back on an exception. So a failed
+        # send leaves no code behind — the user is not left holding a code that
+        # never arrived, and their attempt/hourly counters are untouched.
+        try:
+            await self.sms.send_otp(phone_e164=phone_e164, code=code)
+        except SmsDeliveryError as exc:
+            log.error("otp_send_failed", phone=phone_e164, error=str(exc))
+            raise ServiceUnavailableError(
+                "We could not send the code right now. Please try again in a moment.",
+                code="OTP_SEND_FAILED",
+            ) from exc
 
         log.info(
             "otp_requested",

@@ -41,6 +41,7 @@ router = APIRouter()
     responses={
         403: {"description": "Account suspended"},
         422: {"description": "Invalid phone number, or no role selected"},
+        503: {"description": "The SMS gateway could not be reached — safe to retry"},
     },
 )
 async def request_otp(
@@ -52,12 +53,17 @@ async def request_otp(
     A role (`RENTER` or `PROVIDER`) must be chosen here. It is stored against
     the code, so it cannot be changed at verification time.
 
-    The response tells you whether this is a new number, and whether to collect
-    a name before verifying.
+    The phone number is accepted in any common form — `9876543210`,
+    `09876543210`, `+919876543210`, `91 98765 43210` — and normalised to E.164,
+    so one person typing it four ways is still one account.
 
-    **Local development:** no SMS is sent. The code is printed in the server
-    terminal as `fake_sms_otp ... otp=123456`. The dev bypass code from
-    `OTP_DEV_BYPASS_CODE` also works for any number.
+    The response tells you whether this is a new number, and whether to collect
+    a name before verifying. The number comes back **masked**, for display.
+
+    **Local development:** no SMS is sent — the code is printed in the server
+    terminal as `fake_sms_otp ... otp=1234`, and `OTP_DEV_BYPASS_CODE` works for
+    any number. **Production:** delivered by SMS through Twilio; a gateway
+    failure returns `503 OTP_SEND_FAILED` and is safe to retry.
     """
     return await service.request_otp(phone_e164=payload.phone, role=payload.role)
 
@@ -80,6 +86,10 @@ async def verify_otp(
 
     The user row is created **here**, only after the phone number has been
     proved — so unverified numbers never enter the database.
+
+    A code works exactly once and expires. Wrong guesses are counted: after
+    `OTP_MAX_ATTEMPTS` the code is burned and a new one must be requested.
+    `details.remaining_attempts` on a `400 OTP_INVALID` says how many are left.
 
     If the number already exists but lacks the requested role, the role is
     granted. One phone number can be both a renter and a provider.

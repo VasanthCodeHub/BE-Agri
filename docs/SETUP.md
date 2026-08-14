@@ -244,6 +244,71 @@ uv run uvicorn app.main:app --reload --port 8000
 > hints and Pydantic schemas — so **writing accurate types directly improves
 > your API documentation.**
 
+### 2.5 SMS delivery — where the Twilio credentials go
+
+**You do not need Twilio to develop.** Locally `SMS_PROVIDER=fake` prints the
+code in your terminal, and `OTP_DEV_BYPASS_CODE=0000` logs in any number. Twilio
+is only switched on in production.
+
+#### The flow (we own the OTP, Twilio just carries it)
+
+```
+user enters phone → our backend generates a 4-digit code and stores its
+Argon2 hash → Twilio Messaging API sends the SMS → user types the code →
+our backend verifies it against the stored hash
+```
+
+This is Twilio **Programmable SMS**. It is *not* Twilio Verify, so there is no
+`TWILIO_VERIFY_SERVICE_SID` in this project — with Verify, Twilio would generate,
+store and check the code, replacing the `otp_requests` table, the expiry, the
+attempt limit and the role-locked-to-the-code rule we already have.
+
+#### Where to put the values
+
+All three go in **`.env`**, under `# --- Twilio (production only) ---`:
+
+| Variable | Where to find it in the Twilio console |
+|---|---|
+| `TWILIO_ACCOUNT_SID` | Console **dashboard**, "Account Info" panel — starts with `AC` |
+| `TWILIO_AUTH_TOKEN` | Same panel, click **Show** to reveal it |
+| `TWILIO_PHONE_NUMBER` | **Phone Numbers → Manage → Active numbers**, in E.164 (`+12025550123`) |
+
+```dotenv
+TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+TWILIO_AUTH_TOKEN=your_auth_token_here
+TWILIO_PHONE_NUMBER=+12025550123
+```
+
+> ⚠️ The auth token is a **password to your Twilio account** — anyone holding it
+> can send SMS you pay for. `.env` is git-ignored, so it never leaves your
+> machine. Production does **not** use a `.env` file at all: the same three
+> variables are injected as real environment variables by the host, and the
+> `Settings` class reads them identically.
+
+#### Sending a real SMS from your machine (optional, costs money)
+
+```dotenv
+SMS_PROVIDER=twilio       # was: fake
+```
+
+Restart the server. Nothing else changes — the factory in
+`app/integrations/sms/__init__.py` swaps the implementation and the auth code is
+untouched. Set it back to `fake` afterwards.
+
+The app **refuses to start** if `SMS_PROVIDER=twilio` and any of the three values
+is missing or malformed, rather than failing on a real user's login.
+
+#### Two things that will bite you when you first try it
+
+1. **Trial accounts can only send to verified numbers.** Add your own number
+   under *Phone Numbers → Verified Caller IDs* first, or Twilio returns error
+   `21608`.
+2. **Delivery to India needs DLT registration.** TRAI requires a registered
+   entity, header (sender ID) and message template; an unregistered sender gets
+   filtered by the carrier (error `30007`), often *silently*. The wording lives
+   in `SMS_OTP_TEMPLATE` precisely so it can be made to match the registered
+   template character for character.
+
 ---
 
 ## 3. Daily workflow

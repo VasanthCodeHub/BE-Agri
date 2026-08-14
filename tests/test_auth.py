@@ -11,8 +11,11 @@ exist so that cannot silently return.
 
 from __future__ import annotations
 
+import pytest
 from httpx import AsyncClient
 
+import app.integrations.sms as sms_registry
+from app.integrations.sms.base import SmsDeliveryError
 from app.integrations.sms.fake import FakeSmsProvider
 
 AUTH = "/api/v1/auth"
@@ -53,6 +56,28 @@ async def test_response_never_contains_the_full_phone_number(
     body = response.json()
     assert body["phone"] == "+9198****0001"
     assert phone not in response.text
+
+
+async def test_a_failed_sms_send_is_a_503_not_a_500(
+    client: AsyncClient, phone: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dead gateway is a retryable outage, and the app must say so.
+
+    Without the handler in the service this surfaced as a generic 500
+    INTERNAL_ERROR, which tells the mobile app nothing about whether retrying
+    is worth it.
+    """
+
+    class BrokenGateway:
+        async def send_otp(self, *, phone_e164: str, code: str) -> None:
+            raise SmsDeliveryError("gateway unreachable")
+
+    monkeypatch.setattr(sms_registry, "_provider", BrokenGateway())
+
+    response = await client.post(f"{AUTH}/otp/request", json={"phone": phone, "role": "RENTER"})
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "OTP_SEND_FAILED"
 
 
 async def test_role_is_required(client: AsyncClient, phone: str) -> None:
