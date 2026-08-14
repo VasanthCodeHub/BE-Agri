@@ -46,7 +46,7 @@ def settings() -> Settings:
         database_url="postgresql+asyncpg://agri:agri_local_password@localhost:5432/agri_local",
         cors_origins="http://testserver",
         sms_provider="fake",
-        otp_dev_bypass_code="000000",
+        otp_dev_bypass_code="0000",
         otp_max_attempts=5,
     )
 

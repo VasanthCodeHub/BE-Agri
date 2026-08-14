@@ -23,7 +23,7 @@ async def _login(
 ) -> dict:
     """Helper: complete a login with the dev bypass code."""
     await client.post(f"{AUTH}/otp/request", json={"phone": phone, "role": role})
-    body: dict = {"phone": phone, "code": "000000"}
+    body: dict = {"phone": phone, "code": "0000"}
     if name:
         body["name"] = name
     response = await client.post(f"{AUTH}/otp/verify", json=body)
@@ -111,7 +111,7 @@ async def test_verify_creates_the_user_and_returns_tokens(client: AsyncClient, p
 async def test_new_user_must_supply_a_name(client: AsyncClient, phone: str) -> None:
     await client.post(f"{AUTH}/otp/request", json={"phone": phone, "role": "RENTER"})
 
-    response = await client.post(f"{AUTH}/otp/verify", json={"phone": phone, "code": "000000"})
+    response = await client.post(f"{AUTH}/otp/verify", json={"phone": phone, "code": "0000"})
 
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "NAME_REQUIRED"
@@ -125,7 +125,7 @@ async def test_the_real_otp_works_not_only_the_bypass(
 
     sent_phone, code = sms.sent[-1]
     assert sent_phone == "+919800000001"
-    assert len(code) == 6 and code.isdigit()
+    assert len(code) == 4 and code.isdigit()
 
     response = await client.post(
         f"{AUTH}/otp/verify", json={"phone": phone, "code": code, "name": "Real OTP"}
@@ -138,7 +138,7 @@ async def test_a_code_works_only_once(client: AsyncClient, phone: str) -> None:
 
     # The bypass code needs an active OTP record; the first login consumed it.
     response = await client.post(
-        f"{AUTH}/otp/verify", json={"phone": phone, "code": "000000", "name": "X"}
+        f"{AUTH}/otp/verify", json={"phone": phone, "code": "0000", "name": "X"}
     )
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "OTP_NOT_FOUND"
@@ -148,14 +148,14 @@ async def test_wrong_code_decrements_remaining_attempts(client: AsyncClient, pho
     """Regression test: the attempt counter must PERSIST across requests.
 
     This was broken initially — the increment was rolled back by the error
-    response, so an attacker had unlimited guesses at a 6-digit code.
+    response, so an attacker had unlimited guesses at a 4-digit code.
     """
     await client.post(f"{AUTH}/otp/request", json={"phone": phone, "role": "RENTER"})
 
     seen = []
     for _ in range(5):
         response = await client.post(
-            f"{AUTH}/otp/verify", json={"phone": phone, "code": "111111", "name": "X"}
+            f"{AUTH}/otp/verify", json={"phone": phone, "code": "1111", "name": "X"}
         )
         assert response.status_code == 400
         error = response.json()["error"]
@@ -166,7 +166,7 @@ async def test_wrong_code_decrements_remaining_attempts(client: AsyncClient, pho
 
     # The code is burned once the limit is reached.
     final = await client.post(
-        f"{AUTH}/otp/verify", json={"phone": phone, "code": "000000", "name": "X"}
+        f"{AUTH}/otp/verify", json={"phone": phone, "code": "0000", "name": "X"}
     )
     assert final.json()["error"]["code"] == "OTP_NOT_FOUND"
 
@@ -198,7 +198,7 @@ async def test_role_is_taken_from_the_otp_record_not_the_verify_request(
 
     response = await client.post(
         f"{AUTH}/otp/verify",
-        json={"phone": phone, "code": "000000", "name": "X", "role": "PROVIDER"},
+        json={"phone": phone, "code": "0000", "name": "X", "role": "PROVIDER"},
     )
 
     assert response.status_code == 200

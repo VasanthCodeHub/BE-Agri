@@ -149,7 +149,7 @@ class AuthService:
                     await self.repo.invalidate_otps_for_phone(phone_e164)
                 # The whole point of counting attempts is that the count
                 # persists. Without this commit the rollback discards it and an
-                # attacker gets unlimited guesses at a 6-digit code.
+                # attacker gets unlimited guesses at a 4-digit code.
                 await self.repo.commit()
                 log.info("otp_verify_failed", phone=phone_e164, remaining_attempts=remaining)
                 raise BadRequestError(

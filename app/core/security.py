@@ -2,11 +2,14 @@
 
 TWO DIFFERENT HASHES, ON PURPOSE
 --------------------------------
-**OTP codes → Argon2.** A 6-digit code has only a million possibilities. If the
-database leaked, a fast hash (SHA-256) would let an attacker try all million in
-under a second. Argon2 is deliberately slow and salted, so that attack becomes
+**OTP codes → Argon2.** A 4-digit code has only 10,000 possibilities. If the
+database leaked, a fast hash (SHA-256) would let an attacker try all 10,000
+instantly. Argon2 is deliberately slow and salted, so that attack becomes
 impractical. We can afford the ~50ms because we only verify one code per
 request.
+
+The short code is also why the attempt limit matters so much: online, an
+attacker gets OTP_MAX_ATTEMPTS guesses out of 10,000 before the code is burned.
 
 **Refresh tokens → SHA-256.** These are 384 bits of randomness — brute force is
 impossible regardless of hash speed. More importantly, we must *look up* a token

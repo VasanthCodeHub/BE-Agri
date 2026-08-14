@@ -94,7 +94,10 @@ class Settings(BaseSettings):
     storage_backend: str = "local"
 
     # --- OTP policy --------------------------------------------------------
-    otp_length: int = 6
+    #: 4 digits, matching what Indian users expect from most local apps. Only
+    #: 10,000 possibilities, so OTP_MAX_ATTEMPTS below is what actually keeps
+    #: guessing impractical — see the note in core/security.py.
+    otp_length: int = 4
     otp_ttl_seconds: int = 300
     otp_max_attempts: int = 5
     otp_max_per_phone_per_hour: int = 3

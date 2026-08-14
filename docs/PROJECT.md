@@ -105,7 +105,7 @@ Builder (no Docker). See `docs/SETUP.md` §1.
 
 ### ADR-003 — Phone number + OTP authentication
 
-Primary auth is **phone (E.164) + 6-digit SMS OTP**. Passwords only for admins.
+Primary auth is **phone (E.164) + 4-digit SMS OTP**. Passwords only for admins.
 
 **Why:** target users are agricultural vehicle owners and renters in Tier 2
 cities — the PDF explicitly notes low digital literacy. Email is often absent;
@@ -283,7 +283,7 @@ and did nothing:
 
 | Write | Then | Actual result |
 |---|---|---|
-| `attempts += 1` | raise `OTP_INVALID` | counter rolled back → **unlimited guesses at a 6-digit code** |
+| `attempts += 1` | raise `OTP_INVALID` | counter rolled back → **unlimited guesses at a 4-digit code** |
 | `revoke_family()` | raise `TOKEN_REUSED` | revocation rolled back → **stolen token still worked** |
 
 Both are covered by regression tests now (`test_wrong_code_decrements_remaining_attempts`,
@@ -510,7 +510,7 @@ Ordered by real risk to this product.
 
 ### 6.2 OTP abuse and SMS pumping fraud
 Every OTP costs money; unprotected, this is a budget-drain attack.
-- 6 digits, **stored hashed**, 5-minute expiry, max 5 attempts then invalidated.
+- 4 digits, **stored hashed**, 5-minute expiry, max 5 attempts then invalidated.
 - Per-phone (3/hour) and per-IP limits; exponential backoff.
 - Constant-time comparison; identical response whether or not the phone exists
   (no user enumeration).
@@ -694,7 +694,7 @@ Building on these unless corrected. Each is a place the design could shift.
 | ✅ | `otp_requests` + `refresh_tokens` models and migration |
 | ✅ | SMS port + fake adapter (prints the OTP to the terminal) |
 | ✅ | OTP request/verify: Argon2 hashing, expiry, single use, attempt limits |
-| ✅ | Dev bypass code `000000`, blocked at startup in production |
+| ✅ | Dev bypass code `0000`, blocked at startup in production |
 | ✅ | `security.py`: JWT issue/verify, Argon2, `secrets`-based token generation |
 | ✅ | Refresh token rotation + reuse detection + family revocation |
 | ✅ | `get_current_user`, `get_active_role`, `require_role` dependencies |
