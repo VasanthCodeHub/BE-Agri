@@ -10,9 +10,9 @@
 | Stack | Python 3.11+ · FastAPI · PostgreSQL 16 + PostGIS · SQLAlchemy 2.0 async · Alembic |
 | Mobile client | Flutter (separate team) |
 | Environments | `local` · `production` |
-| Database | PostgreSQL **18** running locally, `agri_local`, migrations at `73d129f5ac63` ✅ |
-| Status | **Phase 0 + Phase 1 complete** — login API working, 31 tests passing. Next: Phase 2 (profiles) |
-| Last updated | 2026-08-13 |
+| Database | PostgreSQL **18** running locally, `agri_local`, migrations at `171ff741f85d` ✅ · PostGIS **not installed yet** |
+| Status | **Phases 0, 1 and 4 complete; Phase 3 covered by Cloudinary** — auth + vehicle listings working, 112 tests passing. Next: Phase 2 (profiles) |
+| Last updated | 2026-08-14 |
 
 ---
 
@@ -164,9 +164,54 @@ presigned URLs for upload and download. The database stores only the object key.
 **Why:** files never touch the app server, so uploads don't consume app
 CPU/bandwidth and the app stays stateless.
 
-**Status: deferred.** `STORAGE_BACKEND=local` writes to a folder on disk for
-now, behind a storage interface. Object storage is a config swap when we choose
-a provider.
+**Status: superseded for images by ADR-016.** Vehicle photos now go to
+Cloudinary via signed direct uploads. The principle survives intact — files never
+touch the app server, and the database stores only a key — but the mechanism is
+Cloudinary's signature rather than S3 presigned URLs. Verification documents
+(Phase 5) are still open; they are private, so they may need a different bucket
+and stricter delivery than public listing photos.
+
+### ADR-016 — Cloudinary signed direct uploads for vehicle photos
+
+The Flutter app uploads photos **straight to Cloudinary**. This backend never
+receives the image bytes; it only authorises each upload by signing it.
+
+```
+app ──"may I upload?"──▶ our API      (tiny JSON, PROVIDER token required)
+app ◀──── signature ──── our API
+app ──── the photo ────▶ Cloudinary   (big, and direct)
+```
+
+**Why not proxy the file through FastAPI:** the photo would travel twice, and a
+provider on rural 4G would wait twice as long while a worker sat holding the
+bytes. Cloudinary's edge is far closer to the user than our server will be.
+
+**Why signed and not an unsigned upload preset:** an unsigned preset accepts
+uploads from anyone. The cloud name and preset name both ship inside the APK, and
+an APK is trivial to unpack — so a stranger could exhaust the quota or host their
+own files on the account, with nothing recording who did it. A signature requires
+a valid access token from this API first, and cannot be forged without the API
+secret, which never leaves the server. It also expires.
+
+**The backend chooses the `public_id`, not the client.** It is one of the signed
+parameters, so it cannot be altered. Otherwise a caller could aim an upload at
+`agri/documents/…` and overwrite a provider's verification papers.
+
+**The database stores the `public_id`, never a URL.** Three consequences:
+
+- **Sizes.** One id serves any dimension, so the feed requests 400px thumbnails
+  while the detail screen gets full size. A stored URL would force every list
+  card to download a full-resolution photo — on a rural connection that is the
+  difference between a usable and an unusable app.
+- **Verification.** An id inside our own folder is provably ours. An arbitrary
+  URL could point anywhere, at content that changes or disappears.
+- **Portability.** Moving off Cloudinary changes one URL-building function
+  instead of every stored row.
+
+**EXIF stripping is a requirement, not a nicety.** A photo taken in a provider's
+yard carries their GPS position in its metadata. ADR-009 keeps provider locations
+out of every renter-facing response; an unstripped photo would hand them over
+anyway. Configured on the Cloudinary upload preset.
 
 ### ADR-008 — Telephony masking behind a provider-agnostic port *(vendor TBD)*
 
@@ -330,8 +375,9 @@ agri/
 │   │   ├── logging.py              ✅ structlog + phone/secret masking
 │   │   ├── exceptions.py           ✅ error hierarchy + envelope handlers
 │   │   ├── middleware.py           ✅ request id, timing, security headers
-│   │   ├── rate_limit.py           ⬜ Phase 1
-│   │   └── security.py             ⬜ Phase 1 (JWT, hashing)
+│   │   ├── phone.py                ✅ E.164 normalisation (Indian mobiles)
+│   │   ├── rate_limit.py           ⬜ deferred (ADR-010)
+│   │   └── security.py             ✅ JWT, Argon2 OTP hashing, refresh tokens
 │   ├── db/
 │   │   ├── base.py                 ✅ DeclarativeBase, UUID + timestamp mixins
 │   │   ├── session.py              ✅ async engine, get_db, check_database
@@ -340,17 +386,30 @@ agri/
 │   │       ├── env.py              ✅ reads URL from Settings; ignores PostGIS tables
 │   │       ├── script.py.mako      ✅ migration template
 │   │       └── versions/
-│   │           └── ..._enable_postgis.py  ✅ first migration
-│   ├── modules/                    ⬜ auth, users, providers, vehicles, media,
-│   │                                  verification, search, calls, admin
-│   ├── integrations/               ⬜ sms/ (port + fake + real), storage/
+│   │           ├── ..._enable_postgis.py         ✅ extensions
+│   │           ├── ..._add_users_roles_otp_...py  ✅ identity + auth tables
+│   │           ├── ..._add_vehicle_types_...py    ✅ listings + seeded taxonomy
+│   │           └── ..._store_cloudinary_public_id ✅ images keyed by public_id
+│   ├── modules/
+│   │   ├── auth/                   ✅ router, service, repository, schemas, deps
+│   │   ├── users/                  ✅ models only (profiles = Phase 2)
+│   │   ├── vehicles/               ✅ full CRUD + public feed + registration rules
+│   │   ├── uploads/                ✅ Cloudinary signature endpoint
+│   │   └── providers, verification, search, calls, admin   ⬜
+│   ├── integrations/
+│   │   ├── sms/                    ✅ port + fake + twilio
+│   │   └── cloudinary.py           ✅ upload signing + delivery URLs
 │   └── api/
 │       ├── health.py               ✅ /health, /ready
 │       └── v1/router.py            ✅ mounts feature routers
 │
 └── tests/
-    ├── conftest.py                 ✅ app + client fixtures
-    └── test_health.py              ✅ 8 tests passing
+    ├── conftest.py                 ✅ app + client + rolled-back session fixtures
+    ├── test_health.py              ✅
+    ├── test_auth.py                ✅
+    ├── test_sms_twilio.py          ✅
+    ├── test_uploads.py             ✅
+    └── test_vehicles.py            ✅  112 tests total
 ```
 
 **Why feature modules rather than top-level `routers/`, `models/`, `services/`:**
@@ -372,9 +431,9 @@ soft delete where history matters · Postgres enum types · UTC timestamps.
 | `users` | Identity for renters & providers | `phone_e164` **unique**, `role`, `status`, `phone_verified_at` |
 | `user_profiles` | Renter details | `user_id`, `full_name`, `city`, `preferred_language` |
 | `provider_profiles` | Provider details | `user_id`, `display_name`, `address`, **`location geography(Point,4326)`**, `service_radius_km`, `verification_status`, `verified_at`, `verified_by` |
-| `vehicle_types` | Seeded taxonomy | `code`, `name_en`, `name_ta`, `icon` — reference data, not free text |
-| `vehicles` | Listings | `provider_id`, `vehicle_type_id`, `registration_number`, `make`, `model`, `year`, `capacity`, `price_amount`, `price_unit`, `is_available`, `listing_status` |
-| `vehicle_photos` | Images | `vehicle_id`, `object_key`, `thumb_key`, `sort_order` |
+| `vehicle_types` ✅ | Seeded taxonomy | `code`, `name_en`, `name_ta`, `sort_order`, `is_active` — reference data, not free text. 12 provisional rows seeded by migration; **Tamil names need a native speaker's review** |
+| `vehicles` ✅ | Listings | `provider_user_id`, `vehicle_type_id`, `registration_number` (**unique among live rows**), `name`, `brand`, `model`, `manufacture_year`, `note`, `price_amount` (paise), `price_unit`, `location_text`, `latitude`/`longitude` (nullable), `fuel_type`, `power_hp`, `transmission`, `is_available`, `listing_status`, `deleted_at` |
+| `vehicle_images` ✅ | Photos | `vehicle_id`, **`public_id`** (Cloudinary), `sort_order` — URLs are derived, not stored (ADR-016) |
 | `documents` | KYC files | `owner_type`, `owner_id`, `doc_type`, `object_key`, `status`, `reviewed_by`, `rejection_reason` |
 | `verification_events` | Immutable approval audit | `subject_type`, `subject_id`, `from_status`, `to_status`, `actor_id`, `reason` |
 | `otp_requests` | OTP state *(was Redis — ADR-010)* | `phone_e164`, `code_hash`, `attempts`, `expires_at`, `consumed_at` |
@@ -430,36 +489,45 @@ listing.
 ### 4.5 Planned endpoint surface
 
 ```
-POST   /api/v1/auth/otp/request           # rate limited
-POST   /api/v1/auth/otp/verify            # -> access + refresh tokens
-POST   /api/v1/auth/refresh
-POST   /api/v1/auth/logout
+✅ POST   /api/v1/auth/otp/request           # rate limiting still deferred
+✅ POST   /api/v1/auth/otp/verify            # -> access + refresh tokens
+✅ POST   /api/v1/auth/refresh
+✅ POST   /api/v1/auth/logout
+✅ GET    /api/v1/auth/me
 
-GET    /api/v1/me
-PATCH  /api/v1/me/renter-profile
-PATCH  /api/v1/me/provider-profile        # includes location + service radius
+⬜ PATCH  /api/v1/me/renter-profile
+⬜ PATCH  /api/v1/me/provider-profile        # includes location + service radius
 
-GET    /api/v1/vehicle-types
-POST   /api/v1/provider/vehicles
-GET    /api/v1/provider/vehicles
-PATCH  /api/v1/provider/vehicles/{id}
-PATCH  /api/v1/provider/vehicles/{id}/availability
-POST   /api/v1/provider/vehicles/{id}/photos
-POST   /api/v1/provider/documents
-POST   /api/v1/provider/submit-verification
-GET    /api/v1/provider/verification-status
+✅ GET    /api/v1/vehicle-types              # seeded taxonomy
+✅ POST   /api/v1/provider/uploads/signature # authorises a direct Cloudinary upload
+✅ POST   /api/v1/provider/vehicles
+✅ GET    /api/v1/provider/vehicles
+✅ GET    /api/v1/provider/vehicles/{id}     # owner view, for the edit screen
+✅ PATCH  /api/v1/provider/vehicles/{id}     # partial
+✅ PATCH  /api/v1/provider/vehicles/{id}/availability
+✅ DELETE /api/v1/provider/vehicles/{id}     # soft
+✅ GET    /api/v1/vehicles                   # public feed, paginated, type filter
+✅ GET    /api/v1/vehicles/{id}              # public detail, NO phone number
 
-GET    /api/v1/search/providers           # lat, lng, radius_km, vehicle_type, cursor
-GET    /api/v1/listings/{vehicle_id}      # NO phone number in response
+⬜ POST   /api/v1/provider/documents
+⬜ POST   /api/v1/provider/submit-verification
+⬜ GET    /api/v1/provider/verification-status
 
-POST   /api/v1/calls/initiate             # + Idempotency-Key
+⬜ GET    /api/v1/search/providers           # lat, lng, radius_km, vehicle_type, cursor
+⬜ POST   /api/v1/calls/initiate             # + Idempotency-Key
 
-POST   /api/v1/admin/auth/login
-GET    /api/v1/admin/verifications
-POST   /api/v1/admin/verifications/{id}/approve
-POST   /api/v1/admin/verifications/{id}/reject
-POST   /api/v1/admin/providers            # manual onboarding (R10)
+⬜ POST   /api/v1/admin/auth/login
+⬜ GET    /api/v1/admin/verifications
+⬜ POST   /api/v1/admin/verifications/{id}/approve
+⬜ POST   /api/v1/admin/verifications/{id}/reject
+⬜ POST   /api/v1/admin/providers            # manual onboarding (R10)
 ```
+
+Two names changed from the original plan. `POST /provider/vehicles/{id}/photos`
+never appeared: photos are attached by passing Cloudinary `public_id`s to the
+create/edit endpoints, because the app uploads directly (ADR-016). And listing
+detail is `GET /vehicles/{id}` rather than `/listings/{id}`, so the public feed
+and the item it returns share a prefix.
 
 ---
 
@@ -630,8 +698,8 @@ Building on these unless corrected. Each is a place the design could shift.
 | # | Question | Why it matters | Blocks |
 |---|---|---|---|
 | Q1 | Confirm phone+OTP auth (A1)? | Determines the whole identity model | Auth |
-| Q2 | Which **SMS provider**, and is an account available? | Hard dependency for real login | Auth (real adapter) |
-| Q3 | Is **DLT registration** (TRAI) done for sender ID + OTP template? | In India transactional SMS is undeliverable without it, and approval can take **weeks** — a schedule risk, not a code problem | Auth (production) |
+| Q2 | ~~Which **SMS provider**?~~ **Answered 2026-08-14: Twilio.** Adapter built and credentials verified. The account is on the **trial tier**, which cannot send custom text (`572006`) — it must be upgraded before any real OTP can be delivered | Hard dependency for real login | ~~Auth~~ → account upgrade |
+| Q3 | Is **DLT registration** (TRAI) done for sender ID + OTP template? **Still open, and now the critical path.** `SMS_OTP_TEMPLATE` is configurable precisely so it can be made to match the registered template character for character | In India transactional SMS is undeliverable without it, and approval can take **weeks** — a schedule risk, not a code problem | Auth (production) |
 | Q4 | Which **masked-calling vendor**, and what per-minute budget? | The MVP's headline feature can't be built or tested without it | Calls |
 | Q5 | Are calls **recorded**? If so, consent + retention policy needed. | Legal exposure | Calls |
 | Q6 | Is the discoverable unit a **provider** or an individual **vehicle**? | Changes the search query, response shape and Flutter cards | Search |
@@ -645,10 +713,10 @@ Building on these unless corrected. Each is a place the design could shift.
 |---|---|---|
 | Q10 | Radius fixed by config or user-selectable? | Config default **25 km**; user picks 5/10/25/50; hard max 100 |
 | Q11 | Must a renter log in to search? | Browsing anonymous, **login required to call** |
-| Q12 | Fixed list of vehicle types — please supply it | Seeded table (tractor, harvester, rotavator, tiller…); admin can extend |
+| Q12 | Fixed list of vehicle types — please supply it | **12 provisional types seeded** (tractor, power tiller, harvester, rotavator, plough, seed drill, sprayer, thresher, baler, leveller, trailer, water tanker). A table, not an enum, so the client's real list is a data change. **Tamil names need review** |
 | Q13 | Pricing units: hour / acre / day / trip? | Support all four via a `price_unit` enum |
 | Q14 | Which languages must the API return? | English + Tamil; taxonomy tables carry translated names |
-| Q15 | Max photos per vehicle; max document size? | 6 photos @ 5 MB; documents 10 MB |
+| Q15 | Max photos per vehicle; max document size? | **Implemented: 1–6 photos per vehicle** (API-enforced). File size and format limits belong on the Cloudinary signed upload preset, not in our code. Documents still open |
 | Q16 | Where will production run? | Not decided — deferred by agreement |
 | Q17 | Retention for rejected providers' documents? | Delete 90 days after final rejection |
 | Q18 | Does a listing need separate approval from the provider? | Separate statuses; provider approval auto-approves the first listing |
@@ -701,7 +769,8 @@ Building on these unless corrected. Each is a place the design could shift.
 | ✅ | 5 endpoints: otp/request, otp/verify, refresh, logout, me |
 | ✅ | 23 auth tests, incl. regression tests for the two rollback bugs |
 | ⬜ | Rate limiting — **deferred to production** by agreement (ADR-010) |
-| ⬜ | Real SMS vendor adapter — blocked on Q2/Q3 |
+| ✅ | Real SMS vendor adapter — **Twilio**, with startup credential validation |
+| ⬜ | Real OTP delivery — blocked on upgrading the Twilio account off the trial tier, and on DLT (Q3) |
 
 ### Phase 2 — Profiles
 | | Task |
@@ -710,19 +779,27 @@ Building on these unless corrected. Each is a place the design could shift.
 | ⬜ | Provider profile CRUD with geography point + service radius |
 | ⬜ | Profile-completion flags for app routing (PDF §5.1 step 5) |
 
-### Phase 3 — Media  ⛔ *Q15*
+### Phase 3 — Media ✅ COMPLETE *(via Cloudinary, ADR-016)*
 | | Task |
 |---|---|
-| ⬜ | Storage port + local-disk adapter |
-| ⬜ | Upload validation (real content type, size limits) |
-| ⬜ | EXIF stripping + thumbnail generation |
+| ✅ | ~~Storage port + local-disk adapter~~ → Cloudinary signed direct uploads. The app uploads straight to Cloudinary; image bytes never reach this backend |
+| ✅ | `POST /provider/uploads/signature` — PROVIDER-only, backend-chosen `public_id`, expiring signature |
+| ✅ | Upload validation — two layers: shape (schema, 422) and folder ownership (service, 400 `IMAGE_NOT_RECOGNISED`) |
+| ✅ | Thumbnails — derived from `public_id` at request time (`w_400,c_fill,q_auto,f_auto`), so no generation step and no second stored file |
+| ⚠️ | **EXIF stripping + size/format caps** — configured on the Cloudinary upload preset, which is a console task, not code. **Not yet done** |
+| ⬜ | Orphan cleanup — a photo uploaded for a listing that is never created stays in Cloudinary. Cheap to ignore at pilot scale; worth a sweep later |
 
-### Phase 4 — Vehicle listings  ⛔ *Q12, Q13*
+### Phase 4 — Vehicle listings ✅ COMPLETE
 | | Task |
 |---|---|
-| ⬜ | `vehicle_types` seed script |
-| ⬜ | Vehicle CRUD with ownership enforcement |
-| ⬜ | Photo attach/reorder/delete; availability toggle |
+| ✅ | `vehicle_types` seeded **by migration**, not a script — `vehicles.vehicle_type_id` is NOT NULL, so an empty taxonomy means no listing can be created at all |
+| ✅ | Vehicle CRUD with ownership enforcement — ownership is in the WHERE clause, and a stranger's id returns **404 not 403** so inventory cannot be enumerated |
+| ✅ | Photo attach/reorder/delete — `image_public_ids` replaces the whole set, so reordering is just a new order |
+| ✅ | Availability toggle, and soft delete that releases the registration number for re-listing |
+| ✅ | Public feed + detail, both phone-free and RC-number-free (ADR-009) |
+| ✅ | Registration numbers normalised and **unique among live listings**; state series and BH series both accepted |
+| ✅ | DB check constraints on year, price, power and coordinates |
+| ⬜ | Listing moderation — `listing_status` exists and defaults to `APPROVED` because no admin exists yet. Phase 5 flips the default to `DRAFT` and adds the state machine |
 
 ### Phase 5 — Verification & admin  ⛔ *Q7, Q8, Q9, Q18*
 | | Task |
@@ -783,14 +860,40 @@ Building on these unless corrected. Each is a place the design could shift.
 | 2026-08-13 | Hand-corrected the autogenerated migration: missing `MetaData` import, enum created 3×, enums not dropped on downgrade. Verified with a downgrade/upgrade round-trip |
 | 2026-08-13 | **Found and fixed two security bugs by end-to-end testing** — OTP attempt counter and token-family revocation were both being rolled back (ADR-015). Regression tests added |
 | 2026-08-13 | 31 tests passing, ruff clean, mypy clean; test transactions verified to leave zero rows behind |
+| 2026-08-14 | **OTP shortened to 4 digits.** Only 10,000 possibilities, so the attempt limit is what keeps guessing impractical — noted in `core/security.py` |
+| 2026-08-14 | **Twilio SMS adapter built** (Q2 answered). httpx rather than the official SDK, which is synchronous and would block the event loop for the whole round trip on every OTP |
+| 2026-08-14 | Startup guards for Twilio: partial config, Account SID pasted into the auth-token field, tokens that are not 32 hex characters, non-E.164 sender. Twilio answers all of those with a bare `20003` |
+| 2026-08-14 | A failed SMS send is now `503 OTP_SEND_FAILED` instead of a bare 500, and the OTP row rolls back so no code is left behind that the user never received |
+| 2026-08-14 | **Tested real SMS end to end and found a hard blocker:** the Twilio account is on the trial tier, which rejects custom message bodies (`572006`) and substitutes its own sample code. The credentials and sender number are verified working; only the tier is wrong. Recorded in `integrations/sms/twilio.py` and `SETUP.md` §2.5 |
+| 2026-08-14 | Trial-tier trap worth remembering: `IncomingPhoneNumbers` returns an **empty list** on a trial account, which reads exactly like "the sender number is not on this account". It is not — the Messages log is the endpoint that tells the truth |
+| 2026-08-14 | Swagger landing page generated **from settings**, so the documented OTP length and dev bypass can never drift from the running server |
+| 2026-08-14 | **Phase 4 built:** 3 tables, 9 endpoints, seeded taxonomy, registration-number rules, DB check constraints, soft delete, public feed and detail with no phone or RC number |
+| 2026-08-14 | Hand-corrected the vehicles migration for the same three autogenerate faults as Phase 1 (missing `MetaData` import, enums created more than once, enums not dropped on downgrade). Verified with a downgrade/upgrade round-trip |
+| 2026-08-14 | Hit the `MissingGreenlet` trap on `PATCH availability`: `updated_at` carries `onupdate`, and PostgreSQL returns server defaults via `RETURNING` on INSERT but not on UPDATE, so reading it during serialisation lazy-loads. Fixed in the repository |
+| 2026-08-14 | **ADR-016 — Cloudinary signed direct uploads.** `POST /provider/uploads/signature`; `vehicle_images` now stores `public_id` instead of a URL, so thumbnails are derived per request |
+| 2026-08-14 | 112 tests passing, ruff clean, mypy clean; both new migrations verified reversible |
 
 ## 13. Pending work
 
-**Immediate:** install PostgreSQL + PostGIS (`docs/SETUP.md` §1), then
-`alembic upgrade head`.
+**Blocked on other people, not on code:**
 
-**Next:** Phase 1 — authentication. The fake SMS adapter means this can be
-built and tested end to end without a vendor account.
+| What | Blocked on |
+|---|---|
+| Real SMS OTP delivery | The Twilio account is on the **trial tier**, which cannot send custom text at all (error `572006`) — it must be upgraded. Credentials themselves are verified working |
+| SMS to Indian handsets | **DLT registration** (Q3) — weeks of lead time, so a schedule risk |
+| Real photo uploads | Cloudinary credentials + a signed upload preset (see `docs/SETUP.md` §2.6) |
+| Verification & admin | Q7, Q8, Q9 — document list, whether ID numbers are stored, who the admins are |
+| Masked calling | Q4, Q5 — vendor and recording policy. This is the MVP's headline feature |
+
+**Ready to build now, needs nobody:**
+
+1. **Phase 2 profiles** — `PATCH /me/renter-profile`, `PATCH /me/provider-profile`.
+   The provider half needs **PostGIS**, which is still not installed. Note this
+   contradicts the earlier "PostGIS from Phase 6" plan: the provider profile
+   carries a `geography(Point)` column, so it is needed at Phase 2.
+2. **OTP rate limiting** — deferred by agreement (ADR-010), but the config value
+   and `count_otps_since()` already exist; it is one check in `request_otp`.
+   Matters more now the OTP is 4 digits.
 
 Everything else: §11.
 
@@ -811,3 +914,4 @@ provider earnings analytics.
 | 2026-08-12 | Initial architecture proposal |
 | 2026-08-13 | Revised to two environments; ADR-010 revised (Redis deferred); ADR-007/008 marked deferred; ADR-013 added (UUID keys); Phase 0 completed and verified |
 | 2026-08-13 | ADR-014 added (one phone, multiple roles); ADR-015 added (security side effects commit before raising); assumption A2 confirmed; Phase 1 completed |
+| 2026-08-14 | OTP shortened to 4 digits; Twilio SMS adapter added (Q2 answered); ADR-016 added (Cloudinary signed direct uploads); Phase 4 vehicle listings completed; Phase 3 media covered by Cloudinary rather than local disk |

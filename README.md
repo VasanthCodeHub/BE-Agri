@@ -62,6 +62,9 @@ that separation is what stops private data leaking into a response.
 
 ## Endpoints today
 
+**System** — unversioned, because they are infrastructure and not part of the
+mobile API contract:
+
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/` | Service banner |
@@ -69,8 +72,38 @@ that separation is what stops private data leaking into a response.
 | GET | `/ready` | Readiness — are dependencies reachable? |
 | GET | `/docs` | Interactive API docs (disabled in production) |
 
-Feature endpoints arrive with Phase 1 (authentication). See
-[`docs/PROJECT.md`](docs/PROJECT.md) §11 for the roadmap.
+**Authentication** — phone number + 4-digit OTP, no passwords:
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/api/v1/auth/otp/request` | Step 1 — send a code (role required) |
+| POST | `/api/v1/auth/otp/verify` | Step 2 — log in, creates the user if new |
+| POST | `/api/v1/auth/refresh` | New token pair; rotates the refresh token |
+| POST | `/api/v1/auth/logout` | Revoke this session, or all of them |
+| GET | `/api/v1/auth/me` | Session check on app start |
+
+**Vehicle listings** — `/provider/*` needs the PROVIDER role and only ever
+touches the caller's own vehicles; the rest is public and needs no token:
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/v1/vehicle-types` | The seeded type taxonomy |
+| GET | `/api/v1/vehicles` | Public feed, paginated, filterable by type |
+| GET | `/api/v1/vehicles/{id}` | Public listing detail |
+| POST | `/api/v1/provider/uploads/signature` | Authorise a direct Cloudinary upload |
+| POST | `/api/v1/provider/vehicles` | Add a listing |
+| GET | `/api/v1/provider/vehicles` | My listings |
+| GET | `/api/v1/provider/vehicles/{id}` | One of mine, for the edit screen |
+| PATCH | `/api/v1/provider/vehicles/{id}` | Edit (partial) |
+| PATCH | `/api/v1/provider/vehicles/{id}/availability` | On/off the public feed |
+| DELETE | `/api/v1/provider/vehicles/{id}` | Soft delete |
+
+No public response ever contains a provider's phone number or a vehicle's
+registration number. Contact goes through masked calling (Phase 7).
+
+Profiles, verification, admin, radius search and calling are still to come — see
+[`docs/PROJECT.md`](docs/PROJECT.md) §11 for the roadmap and §13 for what is
+blocked on whom.
 
 ## Environments
 

@@ -3,8 +3,13 @@
 Getting the backend running on **Windows 11**, step by step, with an
 explanation of why each piece exists.
 
-**Status:** Phase 0 (the foundation) is built and passing. The app runs today.
-The remaining step is installing PostgreSQL — §1.
+**Status:** the foundation, authentication and vehicle listings are built and
+passing (112 tests). PostgreSQL is installed and migrated. **PostGIS is not
+installed yet** — needed for provider profiles (§1.2), which is the next phase.
+
+Local development needs no vendor accounts: the OTP is printed to your terminal,
+and `0000` logs in any number. Twilio (§2.5) and Cloudinary (§2.6) are only
+required for real SMS and real photo uploads.
 
 ---
 
@@ -332,6 +337,84 @@ TRAI requires a registered entity, header (sender ID) and message template; an
 unregistered sender gets filtered by the carrier (error `30007`), often
 *silently*. The wording lives in `SMS_OTP_TEMPLATE` precisely so it can be made
 to match the registered template character for character.
+
+### 2.6 Vehicle photos — where the Cloudinary credentials go
+
+**You do not need Cloudinary to develop.** Leave the values empty and everything
+works except the upload endpoint, which answers `503 UPLOADS_NOT_CONFIGURED`.
+
+#### The flow (the app uploads; we only give permission)
+
+```
+app ──"may I upload?"──▶ our API      (tiny JSON, provider token required)
+app ◀──── signature ──── our API
+app ──── the photo ────▶ Cloudinary   (big, and direct)
+app ──── public_id ────▶ our API      (POST /provider/vehicles)
+```
+
+**The image never passes through this backend.** Proxying it would make the photo
+travel twice and leave a worker holding the bytes — bad on rural 4G. We only sign.
+
+The signature is a fingerprint of the upload details mixed with your API secret.
+Cloudinary recomputes it with its own copy and compares. The mix only works one
+way, so a signature captured from network traffic cannot be turned back into the
+secret, and it expires.
+
+#### Where to put the values
+
+All in **`.env`**, under `# --- Cloudinary (vehicle photos) ---`:
+
+| Variable | Where to find it |
+|---|---|
+| `CLOUDINARY_CLOUD_NAME` | Console dashboard → Product Environment Credentials. **Not secret** — it appears in every image URL |
+| `CLOUDINARY_API_KEY` | Same panel |
+| `CLOUDINARY_API_SECRET` | Same panel, click to reveal. **A password — never commit it** |
+
+All three or none: the app refuses to start if only some are set, and
+**production refuses to start without them** (a listing with no photos is not a
+listing).
+
+#### Then create a signed upload preset
+
+A signature controls *who* may upload. The preset controls *what* they may
+upload — and it is a console task, not code:
+
+1. Console → **Settings → Upload → Upload presets → Add preset**
+2. Set **Signing mode: Signed**
+3. Set a **max file size** and **allowed formats** (jpg, png, webp)
+4. **Turn on metadata stripping**
+5. Put the preset's name in `CLOUDINARY_UPLOAD_PRESET`
+
+> ⚠️ **Step 4 is not optional.** A photo taken in a provider's yard carries their
+> **GPS coordinates in its EXIF data**. This whole API is built to keep provider
+> locations out of renter-facing responses — an unstripped photo hands them over
+> anyway, to anyone who downloads the image.
+
+#### Testing it
+
+`POST /api/v1/provider/uploads/signature` with a provider token returns the
+fields to hand to the Cloudinary SDK. Verify your config without uploading
+anything:
+
+```powershell
+uv run python -c "from app.core.config import Settings; print('configured:', Settings().cloudinary_configured)"
+```
+
+#### Why photos are stored as `public_id` and not as a URL
+
+The database keeps `agri/vehicles/9f8e7d6c`, not a link. The API then builds URLs
+per request:
+
+```
+w_400,c_fill  → the list screen's thumbnail
+(no width)    → the detail screen's full photo
+```
+
+One record, any size. If we stored a fixed URL, every card on the feed would
+download a full-resolution photo — which is the main thing that decides whether
+the app feels fast on a rural connection. It also means an image can be checked
+as genuinely ours, and that moving off Cloudinary later changes one function
+instead of every stored row.
 
 ---
 
