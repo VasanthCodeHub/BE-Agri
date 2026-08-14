@@ -298,16 +298,40 @@ untouched. Set it back to `fake` afterwards.
 The app **refuses to start** if `SMS_PROVIDER=twilio` and any of the three values
 is missing or malformed, rather than failing on a real user's login.
 
-#### Two things that will bite you when you first try it
+#### A trial account cannot send our OTP — it must be upgraded first
 
-1. **Trial accounts can only send to verified numbers.** Add your own number
-   under *Phone Numbers → Verified Caller IDs* first, or Twilio returns error
-   `21608`.
-2. **Delivery to India needs DLT registration.** TRAI requires a registered
-   entity, header (sender ID) and message template; an unregistered sender gets
-   filtered by the carrier (error `30007`), often *silently*. The wording lives
-   in `SMS_OTP_TEMPLATE` precisely so it can be made to match the registered
-   template character for character.
+Tested against a real trial account. This is a hard blocker:
+
+```
+572006  Invalid template name. Trial accounts can only use predefined SMS templates.
+```
+
+On trial, `Body` must be one of about ten Twilio template *ids* (`sms_2fa`,
+`sms_account_alerts`, …) and **Twilio substitutes its own text**. Sending
+`Body=sms_2fa` is accepted, and the phone receives:
+
+> Your verification code is **482913**. It expires in 5 minutes. Do not share
+> it. Test message from Twilio.
+
+`482913` is Twilio's fixed sample, not the code our backend generated — so login
+can never complete. **There is no code-side workaround.** Stay on
+`SMS_PROVIDER=fake` until the Twilio account is upgraded (add a payment method).
+
+Other trial-only oddities, so they don't send you hunting:
+
+- Every message gets `"Test message from Twilio."` appended.
+- Only pre-verified destination numbers can receive SMS (`21608` otherwise).
+- `Balance`, `OutgoingCallerIds` and `Alerts` return `401 "not available on a
+  Trial account"`, and `IncomingPhoneNumbers` returns an **empty list** — so an
+  empty number list does *not* mean your sender number is unusable. Check the
+  Messages log instead; that one works.
+
+#### After upgrading: India needs DLT registration
+
+TRAI requires a registered entity, header (sender ID) and message template; an
+unregistered sender gets filtered by the carrier (error `30007`), often
+*silently*. The wording lives in `SMS_OTP_TEMPLATE` precisely so it can be made
+to match the registered template character for character.
 
 ---
 

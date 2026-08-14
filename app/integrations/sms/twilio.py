@@ -35,6 +35,31 @@ the event loop for the whole round trip to Twilio (~200-500ms), during which
 this process serves nobody. The REST API is one form-encoded POST, so we make it
 with httpx and stay async.
 
+A TRIAL ACCOUNT CANNOT SEND OUR OTP — VERIFIED THE HARD WAY
+-----------------------------------------------------------
+A trial account rejects any custom message body with
+
+    572006  Invalid template name. Trial accounts can only use predefined
+            SMS templates.
+
+On trial, `Body` must be one of ~10 Twilio template *identifiers* —
+`sms_2fa`, `sms_account_alerts`, `sms_order_confirmation` and so on — and
+Twilio replaces the content with its own sample text. Sending `Body=sms_2fa`
+is accepted, and the phone receives:
+
+    "Your verification code is 482913. It expires in 5 minutes. Do not
+     share it. Test message from Twilio."
+
+`482913` is Twilio's fixed sample, not the code we generated, so the OTP can
+never arrive and login cannot be completed. There is no workaround in code:
+**the account has to be upgraded** before this provider can be tested for real.
+Until then use `SMS_PROVIDER=fake`, which is what local development wants anyway.
+
+Trial accounts also append "Test message from Twilio." to every message, and
+block several read endpoints (`Balance`, `OutgoingCallerIds`, `Alerts`, and
+`IncomingPhoneNumbers` returns an empty list) — so an empty number list on a
+trial account does NOT mean the sender number is unusable.
+
 INDIA: DLT REGISTRATION IS NOT OPTIONAL
 ---------------------------------------
 TRAI requires every commercial SMS sender to register an Entity, a Header
@@ -74,6 +99,9 @@ _KNOWN_ERRORS = {
     21610: "The recipient has unsubscribed (replied STOP) and cannot be messaged.",
     30007: "Carrier filtered the message — for India this usually means the DLT "
     "template or header does not match SMS_OTP_TEMPLATE.",
+    572006: "This is a TRIAL Twilio account, which cannot send custom text at "
+    "all — so it cannot deliver our OTP. The account must be upgraded. "
+    "See the note above about trial accounts.",
 }
 
 
