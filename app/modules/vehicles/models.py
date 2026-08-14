@@ -238,11 +238,19 @@ class Vehicle(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
 
 class VehicleImage(UUIDPrimaryKeyMixin, Base):
-    """A photo URL attached to a listing.
+    """A photo attached to a listing.
 
-    URLs rather than uploaded files: the client supplies already-hosted images
-    for now. Phase 3 adds real uploads, at which point this table gains an
-    `object_key` alongside `url`.
+    Stores Cloudinary's `public_id` — the asset's path inside the account — and
+    NOT a delivery URL. Three reasons:
+
+    - **Sizes.** One id serves any dimension, so the feed can request 400px
+      thumbnails while the detail screen gets full size. Storing one fixed URL
+      would force every list card to download a full-resolution photo, which on a
+      rural connection is the difference between a usable app and an unusable one.
+    - **Verification.** An id inside our own folder is provably ours; an
+      arbitrary URL could point anywhere on the internet.
+    - **Portability.** Moving off Cloudinary changes one URL-building function
+      rather than every stored row.
     """
 
     __tablename__ = "vehicle_images"
@@ -254,7 +262,8 @@ class VehicleImage(UUIDPrimaryKeyMixin, Base):
     vehicle_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("vehicles.id", ondelete="CASCADE"), index=True
     )
-    url: Mapped[str] = mapped_column(String(500))
+    #: e.g. "agri/vehicles/9f8e7d6c5b4a3928".
+    public_id: Mapped[str] = mapped_column(String(255))
     #: 0-based. The first image is the card thumbnail.
     sort_order: Mapped[int] = mapped_column(Integer)
 

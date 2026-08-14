@@ -48,6 +48,13 @@ def settings() -> Settings:
         sms_provider="fake",
         otp_dev_bypass_code="0000",
         otp_max_attempts=5,
+        # Fake Cloudinary credentials. Nothing is uploaded in tests — these only
+        # exercise signature generation and delivery-URL building, both of which
+        # are pure functions of the config.
+        cloudinary_cloud_name="test-cloud",
+        cloudinary_api_key="123456789012345",
+        cloudinary_api_secret="test-cloudinary-secret",
+        cloudinary_folder="agri/vehicles",
     )
 
 

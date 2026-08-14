@@ -159,6 +159,14 @@ _OPENAPI_TAGS = [
         ),
     },
     {
+        "name": "uploads",
+        "description": (
+            "Permission to upload an image. The app uploads **directly to "
+            "Cloudinary** — image bytes never pass through this API, which is "
+            "what keeps uploads fast on a slow connection."
+        ),
+    },
+    {
         "name": "system",
         "description": (
             "Infrastructure probes, deliberately unversioned — they are not part "

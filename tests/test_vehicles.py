@@ -31,7 +31,7 @@ def _payload(**overrides: Any) -> dict[str, Any]:
         "fuel_type": "DIESEL",
         "power_hp": 47,
         "transmission": "MANUAL",
-        "image_urls": ["https://cdn.example.com/a.jpg"],
+        "image_public_ids": ["agri/vehicles/aaaa1111"],
     }
     body.update(overrides)
     return body
@@ -88,7 +88,12 @@ async def test_provider_can_add_a_vehicle(client: AsyncClient) -> None:
     assert body["price_amount"] == 50000
     assert body["price_label"] == "₹500 / hour"  # paise rendered for display
     assert body["is_available"] is True
-    assert body["image_urls"] == ["https://cdn.example.com/a.jpg"]
+    assert [image["public_id"] for image in body["images"]] == ["agri/vehicles/aaaa1111"]
+    # Delivery URLs are derived from the id, never stored.
+    assert body["images"][0]["url"] == (
+        "https://res.cloudinary.com/test-cloud/image/upload/q_auto,f_auto/agri/vehicles/aaaa1111"
+    )
+    assert "w_400,c_fill" in body["images"][0]["thumb_url"]
 
 
 async def test_adding_a_vehicle_requires_a_token(client: AsyncClient) -> None:
@@ -189,7 +194,7 @@ async def test_every_field_is_mandatory(client: AsyncClient) -> None:
         "fuel_type",
         "power_hp",
         "transmission",
-        "image_urls",
+        "image_public_ids",
     ):
         body = _payload()
         del body[field]
@@ -222,34 +227,61 @@ async def test_implausible_values_are_rejected(client: AsyncClient) -> None:
 # ---------------------------------------------------------------------------
 # Image URL safety
 # ---------------------------------------------------------------------------
-async def test_only_https_image_urls_are_accepted(client: AsyncClient) -> None:
-    """A stored javascript: or data: URL becomes an attack in any webview."""
+async def test_urls_are_rejected_only_public_ids_are_accepted(client: AsyncClient) -> None:
+    """We store Cloudinary ids, not links.
+
+    A stored `javascript:` or `data:` URL becomes an attack the moment a client
+    renders it, and an arbitrary https URL points at content nobody can verify.
+    """
     token = await _token(client, "9810000011")
 
-    for url in (
+    for value in (
+        "https://cdn.example.com/a.jpg",
         "http://cdn.example.com/a.jpg",
         "javascript:alert(1)",
         "data:image/png;base64,AAAA",
-        "not-a-url",
+        "../../etc/passwd",
+        "/agri/vehicles/leading-slash",
+        "agri/vehicles/has spaces",
         "",
     ):
         response = await client.post(
-            f"{API}/provider/vehicles", json=_payload(image_urls=[url]), headers=_auth(token)
+            f"{API}/provider/vehicles",
+            json=_payload(image_public_ids=[value]),
+            headers=_auth(token),
         )
-        assert response.status_code == 422, f"{url!r} was accepted"
+        assert response.status_code == 422, f"{value!r} was accepted"
+
+
+async def test_images_outside_our_folder_are_rejected(client: AsyncClient) -> None:
+    """A well-formed id from elsewhere in the Cloudinary account is still refused.
+
+    Otherwise a caller could attach another app's asset — or a provider's
+    verification document — to a public listing.
+    """
+    token = await _token(client, "9810000047")
+
+    response = await client.post(
+        f"{API}/provider/vehicles",
+        json=_payload(image_public_ids=["agri/documents/someones-rc-book"]),
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "IMAGE_NOT_RECOGNISED"
 
 
 async def test_image_count_is_bounded(client: AsyncClient) -> None:
     token = await _token(client, "9810000012")
 
     no_images = await client.post(
-        f"{API}/provider/vehicles", json=_payload(image_urls=[]), headers=_auth(token)
+        f"{API}/provider/vehicles", json=_payload(image_public_ids=[]), headers=_auth(token)
     )
     assert no_images.status_code == 422
 
     too_many = await client.post(
         f"{API}/provider/vehicles",
-        json=_payload(image_urls=[f"https://cdn.example.com/{i}.jpg" for i in range(7)]),
+        json=_payload(image_public_ids=[f"agri/vehicles/img{i}" for i in range(7)]),
         headers=_auth(token),
     )
     assert too_many.status_code == 422
@@ -260,7 +292,7 @@ async def test_duplicate_image_urls_are_rejected(client: AsyncClient) -> None:
 
     response = await client.post(
         f"{API}/provider/vehicles",
-        json=_payload(image_urls=["https://cdn.example.com/a.jpg"] * 2),
+        json=_payload(image_public_ids=["agri/vehicles/dup1"] * 2),
         headers=_auth(token),
     )
 
@@ -270,11 +302,11 @@ async def test_duplicate_image_urls_are_rejected(client: AsyncClient) -> None:
 async def test_images_keep_their_order(client: AsyncClient) -> None:
     """The first image is the card thumbnail, so order is meaningful."""
     token = await _token(client, "9810000014")
-    urls = [f"https://cdn.example.com/{n}.jpg" for n in ("c", "a", "b")]
+    urls = [f"agri/vehicles/{n}0001" for n in ("c", "a", "b")]
 
-    body = await _create(client, token, image_urls=urls)
+    body = await _create(client, token, image_public_ids=urls)
 
-    assert body["image_urls"] == urls
+    assert [image["public_id"] for image in body["images"]] == urls
 
 
 # ---------------------------------------------------------------------------
@@ -544,7 +576,7 @@ async def test_a_provider_can_edit_one_field(client: AsyncClient) -> None:
     assert body["price_amount"] == 60000
     assert body["price_label"] == "₹600 / hour"
     assert body["name"] == vehicle["name"]  # untouched
-    assert body["image_urls"] == vehicle["image_urls"]
+    assert body["images"] == vehicle["images"]
 
 
 async def test_editing_can_change_the_vehicle_type(client: AsyncClient) -> None:
@@ -585,35 +617,35 @@ async def test_image_urls_are_replaced_as_a_whole_set(client: AsyncClient) -> No
         client,
         token,
         registration_number="TN38EE4444",
-        image_urls=[f"https://cdn.example.com/{n}.jpg" for n in ("a", "b", "c")],
+        image_public_ids=[f"agri/vehicles/{n}0002" for n in ("a", "b", "c")],
     )
 
-    replacement = ["https://cdn.example.com/z.jpg", "https://cdn.example.com/y.jpg"]
+    replacement = ["agri/vehicles/zzz1", "agri/vehicles/yyy1"]
     response = await client.patch(
         f"{API}/provider/vehicles/{vehicle['id']}",
-        json={"image_urls": replacement},
+        json={"image_public_ids": replacement},
         headers=_auth(token),
     )
 
     assert response.status_code == 200, response.text
-    assert response.json()["image_urls"] == replacement
+    assert [i["public_id"] for i in response.json()["images"]] == replacement
 
 
 async def test_reordering_photos_is_just_sending_them_in_a_new_order(
     client: AsyncClient,
 ) -> None:
     token = await _token(client, "9810000037")
-    urls = [f"https://cdn.example.com/{n}.jpg" for n in ("a", "b", "c")]
-    vehicle = await _create(client, token, registration_number="TN38EE5555", image_urls=urls)
+    urls = [f"agri/vehicles/{n}0002" for n in ("a", "b", "c")]
+    vehicle = await _create(client, token, registration_number="TN38EE5555", image_public_ids=urls)
 
     reordered = [urls[2], urls[0], urls[1]]
     response = await client.patch(
         f"{API}/provider/vehicles/{vehicle['id']}",
-        json={"image_urls": reordered},
+        json={"image_public_ids": reordered},
         headers=_auth(token),
     )
 
-    assert response.json()["image_urls"] == reordered
+    assert [i["public_id"] for i in response.json()["images"]] == reordered
 
 
 async def test_omitting_a_coordinate_differs_from_sending_null(client: AsyncClient) -> None:
@@ -695,8 +727,8 @@ async def test_editing_rejects_implausible_values(client: AsyncClient) -> None:
         {"price_amount": 0},
         {"manufacture_year": 1900},
         {"power_hp": 99999},
-        {"image_urls": ["http://cdn.example.com/a.jpg"]},
-        {"image_urls": []},
+        {"image_public_ids": ["http://cdn.example.com/a.jpg"]},
+        {"image_public_ids": []},
         {"name": "x"},
     ):
         response = await client.patch(

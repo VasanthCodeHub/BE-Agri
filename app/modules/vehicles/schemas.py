@@ -17,10 +17,15 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from typing import Annotated
-from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.core.config import Settings
+from app.integrations.cloudinary import (
+    THUMB_WIDTH,
+    build_url,
+    is_well_formed_public_id,
+)
 from app.modules.vehicles.models import (
     MAX_IMAGES,
     MIN_IMAGES,
@@ -29,6 +34,7 @@ from app.modules.vehicles.models import (
     PriceUnit,
     Transmission,
     Vehicle,
+    VehicleImage,
     VehicleType,
 )
 from app.modules.vehicles.registration import (
@@ -36,24 +42,31 @@ from app.modules.vehicles.registration import (
     normalise_registration_number,
 )
 
-#: Only https. A stored `javascript:` or `data:` URL becomes an attack the moment
-#: some client renders it in a webview, and plain http images break under the
-#: app's transport security rules anyway.
-_ALLOWED_URL_SCHEMES = frozenset({"https"})
-
 _MAX_PRICE_PAISE = 100_000_000  # ₹10,00,000 — a sanity ceiling, not a business rule
 
 
-def _validate_image_url(value: str) -> str:
-    url = value.strip()
-    if not url:
-        raise ValueError("Image URL cannot be empty.")
-    parsed = urlparse(url)
-    if parsed.scheme.lower() not in _ALLOWED_URL_SCHEMES:
-        raise ValueError(f"Image URLs must start with https:// (got {url[:40]!r}).")
-    if not parsed.netloc:
-        raise ValueError(f"Image URL is not a valid address ({url[:40]!r}).")
-    return url
+def _validate_public_id(value: str) -> str:
+    """Shape-check a Cloudinary public_id.
+
+    Only the *shape* is checked here. Whether the id sits in our own folder is
+    checked in the service layer, which is the layer that can see settings — a
+    Pydantic validator reading global settings would ignore the per-test
+    overrides and quietly validate against the developer's real `.env`.
+    """
+    public_id = value.strip()
+    if not public_id:
+        raise ValueError("public_id cannot be empty.")
+    if "://" in public_id or public_id.lower().startswith("http"):
+        raise ValueError(
+            "Send Cloudinary's public_id, not a URL — "
+            f"e.g. 'agri/vehicles/9f8e7d6c' (got {public_id[:48]!r})."
+        )
+    if not is_well_formed_public_id(public_id):
+        raise ValueError(
+            f"{public_id[:48]!r} is not a valid public_id. Use the value Cloudinary "
+            "returned from the upload."
+        )
+    return public_id
 
 
 # ---------------------------------------------------------------------------
@@ -128,12 +141,16 @@ class VehicleCreateIn(BaseModel):
     fuel_type: FuelType = Field(..., examples=["DIESEL"])
     power_hp: int = Field(..., ge=1, le=2000, description="Engine power in HP.", examples=[47])
     transmission: Transmission = Field(..., examples=["MANUAL"])
-    image_urls: Annotated[list[str], Field(min_length=MIN_IMAGES, max_length=MAX_IMAGES)] = Field(
-        ...,
-        description=(
-            f"{MIN_IMAGES}-{MAX_IMAGES} https image URLs. The first is the card thumbnail."
-        ),
-        examples=[["https://cdn.example.com/tractor-1.jpg"]],
+    image_public_ids: Annotated[list[str], Field(min_length=MIN_IMAGES, max_length=MAX_IMAGES)] = (
+        Field(
+            ...,
+            description=(
+                f"{MIN_IMAGES}-{MAX_IMAGES} Cloudinary `public_id` values, each from an upload "
+                "authorised by POST /provider/uploads/signature. The first is the card "
+                "thumbnail. Send ids, not URLs."
+            ),
+            examples=[["agri/vehicles/9f8e7d6c5b4a3928"]],
+        )
     )
 
     #: Optional, and the only pair that is: radius search is not built yet. Send
@@ -166,13 +183,13 @@ class VehicleCreateIn(BaseModel):
             raise ValueError("This field cannot be blank.")
         return cleaned
 
-    @field_validator("image_urls")
+    @field_validator("image_public_ids")
     @classmethod
-    def _check_urls(cls, value: list[str]) -> list[str]:
-        urls = [_validate_image_url(url) for url in value]
-        if len(set(urls)) != len(urls):
-            raise ValueError("The same image URL is listed more than once.")
-        return urls
+    def _check_public_ids(cls, value: list[str]) -> list[str]:
+        ids = [_validate_public_id(public_id) for public_id in value]
+        if len(set(ids)) != len(ids):
+            raise ValueError("The same image is listed more than once.")
+        return ids
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +230,7 @@ class VehicleUpdateIn(BaseModel):
     is_available: bool | None = None
     #: Sent as a whole set: the new list **replaces** every existing photo, so
     #: reordering is just sending them in a different order.
-    image_urls: Annotated[
+    image_public_ids: Annotated[
         list[str] | None, Field(default=None, min_length=MIN_IMAGES, max_length=MAX_IMAGES)
     ] = None
 
@@ -237,15 +254,41 @@ class VehicleUpdateIn(BaseModel):
             raise ValueError("This field cannot be blank.")
         return cleaned
 
-    @field_validator("image_urls")
+    @field_validator("image_public_ids")
     @classmethod
-    def _check_urls(cls, value: list[str] | None) -> list[str] | None:
+    def _check_public_ids(cls, value: list[str] | None) -> list[str] | None:
         if value is None:
             return None
-        urls = [_validate_image_url(url) for url in value]
-        if len(set(urls)) != len(urls):
-            raise ValueError("The same image URL is listed more than once.")
-        return urls
+        ids = [_validate_public_id(public_id) for public_id in value]
+        if len(set(ids)) != len(ids):
+            raise ValueError("The same image is listed more than once.")
+        return ids
+
+
+# ---------------------------------------------------------------------------
+# Output — images
+# ---------------------------------------------------------------------------
+class VehicleImageOut(BaseModel):
+    """One photo, at the two sizes a client actually needs.
+
+    Both URLs are derived from the stored `public_id`, not saved anywhere. That
+    is the payoff for storing ids: the list screen can pull a small thumbnail
+    while the detail screen pulls the full picture, from the same record.
+    """
+
+    public_id: str
+    url: str | None = Field(description="Full size. Null if Cloudinary is not configured.")
+    thumb_url: str | None = Field(
+        description=f"{THUMB_WIDTH}px square-cropped — use this in lists to save bandwidth."
+    )
+
+    @classmethod
+    def from_model(cls, image: VehicleImage, *, settings: Settings) -> VehicleImageOut:
+        return cls(
+            public_id=image.public_id,
+            url=build_url(image.public_id, settings),
+            thumb_url=build_url(image.public_id, settings, width=THUMB_WIDTH),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -273,12 +316,12 @@ class VehicleOut(BaseModel):
     transmission: Transmission
     is_available: bool
     listing_status: ListingStatus
-    image_urls: list[str]
+    images: list[VehicleImageOut]
     created_at: datetime
     updated_at: datetime
 
     @classmethod
-    def from_model(cls, vehicle: Vehicle) -> VehicleOut:
+    def from_model(cls, vehicle: Vehicle, *, settings: Settings) -> VehicleOut:
         return cls(
             id=vehicle.id,
             name=vehicle.name,
@@ -299,7 +342,9 @@ class VehicleOut(BaseModel):
             transmission=vehicle.transmission,
             is_available=vehicle.is_available,
             listing_status=vehicle.listing_status,
-            image_urls=[image.url for image in vehicle.images],
+            images=[
+                VehicleImageOut.from_model(image, settings=settings) for image in vehicle.images
+            ],
             created_at=vehicle.created_at,
             updated_at=vehicle.updated_at,
         )
@@ -336,7 +381,7 @@ class VehicleCardOut(BaseModel):
     fuel_type: FuelType
     power_hp: int
     transmission: Transmission
-    image_urls: list[str]
+    images: list[VehicleImageOut]
     provider_id: uuid.UUID = Field(description="Use this to initiate a call (Phase 7).")
     provider_name: str | None
 
@@ -357,14 +402,20 @@ class VehicleCardOut(BaseModel):
                 "fuel_type": "DIESEL",
                 "power_hp": 47,
                 "transmission": "MANUAL",
-                "image_urls": ["https://cdn.example.com/tractor-1.jpg"],
+                "images": [
+                    {
+                        "public_id": "agri/vehicles/9f8e7d6c",
+                        "url": "https://res.cloudinary.com/your-cloud/image/upload/q_auto,f_auto/agri/vehicles/9f8e7d6c",
+                        "thumb_url": "https://res.cloudinary.com/your-cloud/image/upload/w_400,c_fill,q_auto,f_auto/agri/vehicles/9f8e7d6c",
+                    }
+                ],
                 "provider_name": "Ravi Kumar",
             }
         }
     )
 
     @classmethod
-    def from_model(cls, vehicle: Vehicle) -> VehicleCardOut:
+    def from_model(cls, vehicle: Vehicle, *, settings: Settings) -> VehicleCardOut:
         return cls(
             id=vehicle.id,
             name=vehicle.name,
@@ -380,7 +431,9 @@ class VehicleCardOut(BaseModel):
             fuel_type=vehicle.fuel_type,
             power_hp=vehicle.power_hp,
             transmission=vehicle.transmission,
-            image_urls=[image.url for image in vehicle.images],
+            images=[
+                VehicleImageOut.from_model(image, settings=settings) for image in vehicle.images
+            ],
             provider_id=vehicle.provider_user_id,
             provider_name=vehicle.provider.full_name if vehicle.provider else None,
         )

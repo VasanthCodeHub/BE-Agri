@@ -61,9 +61,10 @@ class VehicleRepository:
         )
         return result.first() is not None
 
-    async def create(self, *, vehicle: Vehicle, image_urls: list[str]) -> Vehicle:
+    async def create(self, *, vehicle: Vehicle, public_ids: list[str]) -> Vehicle:
         vehicle.images = [
-            VehicleImage(url=url, sort_order=index) for index, url in enumerate(image_urls)
+            VehicleImage(public_id=public_id, sort_order=index)
+            for index, public_id in enumerate(public_ids)
         ]
         self.db.add(vehicle)
         # flush, not commit: assigns the id and makes the relationships usable
@@ -170,13 +171,13 @@ class VehicleRepository:
         vehicle: Vehicle,
         *,
         fields: dict[str, Any],
-        image_urls: list[str] | None,
+        public_ids: list[str] | None,
     ) -> Vehicle:
         """Write the changed columns, and replace the photos if new ones came."""
         for column, value in fields.items():
             setattr(vehicle, column, value)
 
-        if image_urls is not None:
+        if public_ids is not None:
             # Two flushes on purpose. `sort_order` is unique per vehicle, so
             # inserting the new photos before the old ones are gone would
             # violate that constraint. Clearing and flushing first sends the
@@ -184,7 +185,8 @@ class VehicleRepository:
             vehicle.images.clear()
             await self.db.flush()
             vehicle.images.extend(
-                VehicleImage(url=url, sort_order=index) for index, url in enumerate(image_urls)
+                VehicleImage(public_id=public_id, sort_order=index)
+                for index, public_id in enumerate(public_ids)
             )
 
         await self.db.flush()

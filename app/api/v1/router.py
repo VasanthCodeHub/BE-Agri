@@ -14,6 +14,7 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from app.modules.auth.router import router as auth_router
+from app.modules.uploads.router import router as uploads_router
 from app.modules.vehicles.router import router as vehicles_router
 
 api_router = APIRouter()
@@ -26,6 +27,10 @@ api_router.include_router(auth_router, prefix="/auth", tags=["auth"])
 # No prefix: this module owns both provider-only paths (/provider/vehicles) and
 # public ones (/vehicles, /vehicle-types), so the prefixes live on the routes.
 api_router.include_router(vehicles_router)
+
+# Upload authorisation. Its own module because provider verification documents
+# (Phase 5) will need the same signature.
+api_router.include_router(uploads_router)
 
 # Coming next:
 # api_router.include_router(users_router, prefix="/me", tags=["profile"])

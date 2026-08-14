@@ -24,6 +24,7 @@ import uuid
 from fastapi import APIRouter, Depends, Query, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import Settings, get_settings
 from app.db.session import get_db
 from app.modules.auth.dependencies import require_role
 from app.modules.users.models import User, UserRole
@@ -47,8 +48,11 @@ router = APIRouter()
 provider_only = require_role(UserRole.PROVIDER)
 
 
-def get_vehicle_service(db: AsyncSession = Depends(get_db)) -> VehicleService:
-    return VehicleService(repo=VehicleRepository(db))
+def get_vehicle_service(
+    db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> VehicleService:
+    return VehicleService(repo=VehicleRepository(db), settings=settings)
 
 
 # ---------------------------------------------------------------------------

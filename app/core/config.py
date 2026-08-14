@@ -103,6 +103,26 @@ class Settings(BaseSettings):
     #: "local" saves uploads to a folder on disk. Object storage comes later.
     storage_backend: str = "local"
 
+    # --- Cloudinary (image hosting) ----------------------------------------
+    #: The app uploads photos DIRECTLY to Cloudinary — image bytes never pass
+    #: through this backend. What we do is authorise each upload by signing it,
+    #: which is why the secret lives here and not in the mobile app.
+    #:
+    #: The cloud name is not secret (it appears in every delivery URL) and is
+    #: also what we use to verify that a stored image really is ours.
+    cloudinary_cloud_name: str = ""
+    cloudinary_api_key: str = ""
+    cloudinary_api_secret: SecretStr = SecretStr("")
+    #: Every asset we sign is confined to this folder. We choose the folder AND
+    #: the public_id server-side, so a client cannot aim an upload at another
+    #: part of the account — at provider documents, say.
+    cloudinary_folder: str = "agri/vehicles"
+    #: Optional named upload preset. Configure it in the Cloudinary console to
+    #: cap file size, restrict formats, and STRIP METADATA — a photo taken in
+    #: someone's yard carries their GPS position in its EXIF, and this whole API
+    #: is built to keep provider locations private.
+    cloudinary_upload_preset: str = ""
+
     # --- Twilio ------------------------------------------------------------
     #: Only read when SMS_PROVIDER=twilio. Empty locally, which is why the
     #: fields have defaults: a developer with no Twilio account must still be
@@ -161,6 +181,20 @@ class Settings(BaseSettings):
     @property
     def cors_origins_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
+    @property
+    def cloudinary_configured(self) -> bool:
+        """Can we sign an upload?
+
+        The signature endpoint answers 503 rather than 500 when this is False, so
+        a developer with no Cloudinary account still gets a clear message instead
+        of a stack trace.
+        """
+        return bool(
+            self.cloudinary_cloud_name
+            and self.cloudinary_api_key
+            and self.cloudinary_api_secret.get_secret_value()
+        )
 
     @property
     def docs_enabled(self) -> bool:
@@ -299,6 +333,32 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _cloudinary_all_or_nothing(self) -> Settings:
+        """Reject a half-filled Cloudinary config.
+
+        Setting two of the three values is always a mistake, and the symptom
+        otherwise appears much later as "uploads silently do not work".
+        """
+        provided = {
+            "CLOUDINARY_CLOUD_NAME": bool(self.cloudinary_cloud_name),
+            "CLOUDINARY_API_KEY": bool(self.cloudinary_api_key),
+            "CLOUDINARY_API_SECRET": bool(self.cloudinary_api_secret.get_secret_value()),
+        }
+        if any(provided.values()) and not all(provided.values()):
+            missing = sorted(name for name, present in provided.items() if not present)
+            raise ValueError(
+                "Cloudinary is partly configured. Also set: "
+                + ", ".join(missing)
+                + ". All three are on the Cloudinary console dashboard."
+            )
+        if self.cloudinary_folder.startswith("/") or ".." in self.cloudinary_folder:
+            raise ValueError(
+                "CLOUDINARY_FOLDER must be a plain path like 'agri/vehicles' — "
+                "no leading slash and no '..'"
+            )
+        return self
+
+    @model_validator(mode="after")
     def _enforce_production_rules(self) -> Settings:
         """Refuse to boot production with unsafe settings.
 
@@ -337,6 +397,13 @@ class Settings(BaseSettings):
             )
         if "*" in self.cors_origins_list:
             raise ValueError("CORS_ORIGINS must list explicit origins in production, never '*'")
+        if not self.cloudinary_configured:
+            raise ValueError(
+                "Cloudinary must be configured in production — without it providers "
+                "cannot upload vehicle photos, and a listing with no photos is not "
+                "a listing. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY and "
+                "CLOUDINARY_API_SECRET."
+            )
         return self
 
 

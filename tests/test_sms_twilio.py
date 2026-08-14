@@ -252,7 +252,13 @@ def test_production_with_twilio_is_accepted() -> None:
         twilio_account_sid=ACCOUNT_SID,
         twilio_auth_token=AUTH_TOKEN,
         twilio_phone_number="+12025550123",
+        # Production also requires Cloudinary — providers cannot list a vehicle
+        # without photos, so it is not optional there.
+        cloudinary_cloud_name="prod-cloud",
+        cloudinary_api_key="123456789012345",
+        cloudinary_api_secret="prod-cloudinary-secret",
     )
 
     assert settings.is_production
     assert settings.sms_provider == "twilio"
+    assert settings.cloudinary_configured

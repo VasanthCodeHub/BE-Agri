@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import uuid
 
+from app.core.config import Settings
 from app.core.exceptions import BadRequestError, ConflictError, NotFoundError
 from app.core.logging import get_logger
+from app.integrations.cloudinary import is_in_our_folder
 from app.modules.users.models import User
-from app.modules.vehicles.models import Vehicle
+from app.modules.vehicles.models import MAX_IMAGES, Vehicle
 from app.modules.vehicles.repository import VehicleRepository
 from app.modules.vehicles.schemas import (
     VehicleCardOut,
@@ -30,8 +32,29 @@ log = get_logger(__name__)
 
 
 class VehicleService:
-    def __init__(self, *, repo: VehicleRepository) -> None:
+    def __init__(self, *, repo: VehicleRepository, settings: Settings) -> None:
         self.repo = repo
+        # Settings are needed to turn a stored public_id into delivery URLs, and
+        # to know which Cloudinary folder our own uploads live in.
+        self.settings = settings
+
+    def _check_images_are_ours(self, public_ids: list[str]) -> None:
+        """Reject any image that did not come from an upload we authorised.
+
+        Shape is already validated by the schema; this is the ownership half, and
+        it lives here because only this layer sees settings. Without it a caller
+        could attach an arbitrary asset from elsewhere in the Cloudinary account
+        — a provider's verification document, say — to a public listing.
+        """
+        foreign = [pid for pid in public_ids if not is_in_our_folder(pid, self.settings)]
+        if foreign:
+            raise BadRequestError(
+                "These images did not come from this app's upload endpoint. "
+                "Upload via POST /provider/uploads/signature and send the "
+                "public_id it returns.",
+                code="IMAGE_NOT_RECOGNISED",
+                details={"public_ids": foreign[:MAX_IMAGES]},
+            )
 
     # -----------------------------------------------------------------------
     # Taxonomy
@@ -54,6 +77,8 @@ class VehicleService:
                 code="VEHICLE_TYPE_UNKNOWN",
                 details={"vehicle_type_code": payload.vehicle_type_code},
             )
+
+        self._check_images_are_ours(payload.image_public_ids)
 
         if await self.repo.registration_is_taken(payload.registration_number):
             # Deliberately does not say whose listing it is — that would leak
@@ -82,16 +107,16 @@ class VehicleService:
             power_hp=payload.power_hp,
             transmission=payload.transmission,
         )
-        vehicle = await self.repo.create(vehicle=vehicle, image_urls=payload.image_urls)
+        vehicle = await self.repo.create(vehicle=vehicle, public_ids=payload.image_public_ids)
 
         log.info(
             "vehicle_created",
             vehicle_id=str(vehicle.id),
             provider_id=str(provider.id),
             vehicle_type=vehicle_type.code,
-            images=len(payload.image_urls),
+            images=len(payload.image_public_ids),
         )
-        return VehicleOut.from_model(vehicle)
+        return VehicleOut.from_model(vehicle, settings=self.settings)
 
     # -----------------------------------------------------------------------
     # Read — the provider's own listings
@@ -101,7 +126,7 @@ class VehicleService:
             provider_user_id=provider.id, limit=limit, offset=offset
         )
         return VehiclePage(
-            items=[VehicleOut.from_model(v) for v in vehicles],
+            items=[VehicleOut.from_model(v, settings=self.settings) for v in vehicles],
             total=total,
             limit=limit,
             offset=offset,
@@ -115,7 +140,7 @@ class VehicleService:
         and edit exactly what they have.
         """
         vehicle = await self._own_vehicle(provider=provider, vehicle_id=vehicle_id)
-        return VehicleOut.from_model(vehicle)
+        return VehicleOut.from_model(vehicle, settings=self.settings)
 
     # -----------------------------------------------------------------------
     # Read — the public feed
@@ -127,7 +152,7 @@ class VehicleService:
             limit=limit, offset=offset, type_code=type_code
         )
         return VehicleCardPage(
-            items=[VehicleCardOut.from_model(v) for v in vehicles],
+            items=[VehicleCardOut.from_model(v, settings=self.settings) for v in vehicles],
             total=total,
             limit=limit,
             offset=offset,
@@ -143,7 +168,7 @@ class VehicleService:
         vehicle = await self.repo.get_public_by_id(vehicle_id)
         if vehicle is None:
             raise NotFoundError("Vehicle not found.", code="VEHICLE_NOT_FOUND")
-        return VehicleCardOut.from_model(vehicle)
+        return VehicleCardOut.from_model(vehicle, settings=self.settings)
 
     # -----------------------------------------------------------------------
     # Update
@@ -157,7 +182,9 @@ class VehicleService:
         # exclude_unset is the whole point: it separates "the client did not
         # mention latitude" from "the client sent latitude: null to clear it".
         changes = payload.model_dump(exclude_unset=True)
-        image_urls = changes.pop("image_urls", None)
+        public_ids = changes.pop("image_public_ids", None)
+        if public_ids is not None:
+            self._check_images_are_ours(public_ids)
         type_code = changes.pop("vehicle_type_code", None)
 
         if type_code is not None:
@@ -171,16 +198,16 @@ class VehicleService:
                 )
             changes["vehicle_type_id"] = vehicle_type.id
 
-        vehicle = await self.repo.apply_updates(vehicle, fields=changes, image_urls=image_urls)
+        vehicle = await self.repo.apply_updates(vehicle, fields=changes, public_ids=public_ids)
 
         log.info(
             "vehicle_updated",
             vehicle_id=str(vehicle.id),
             provider_id=str(provider.id),
             changed=sorted(changes),
-            images_replaced=image_urls is not None,
+            images_replaced=public_ids is not None,
         )
-        return VehicleOut.from_model(vehicle)
+        return VehicleOut.from_model(vehicle, settings=self.settings)
 
     # -----------------------------------------------------------------------
     # Availability and delete
@@ -195,7 +222,7 @@ class VehicleService:
             vehicle_id=str(vehicle.id),
             is_available=is_available,
         )
-        return VehicleOut.from_model(vehicle)
+        return VehicleOut.from_model(vehicle, settings=self.settings)
 
     async def delete_vehicle(self, *, provider: User, vehicle_id: uuid.UUID) -> None:
         vehicle = await self._own_vehicle(provider=provider, vehicle_id=vehicle_id)
