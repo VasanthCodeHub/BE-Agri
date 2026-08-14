@@ -14,6 +14,7 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from app.modules.auth.router import router as auth_router
+from app.modules.vehicles.router import router as vehicles_router
 
 api_router = APIRouter()
 
@@ -22,7 +23,10 @@ api_router = APIRouter()
 # section in the docs.
 api_router.include_router(auth_router, prefix="/auth", tags=["auth"])
 
+# No prefix: this module owns both provider-only paths (/provider/vehicles) and
+# public ones (/vehicles, /vehicle-types), so the prefixes live on the routes.
+api_router.include_router(vehicles_router)
+
 # Coming next:
 # api_router.include_router(users_router, prefix="/me", tags=["profile"])
-# api_router.include_router(vehicles_router, prefix="/provider", tags=["vehicles"])
 # api_router.include_router(search_router, prefix="/search", tags=["search"])

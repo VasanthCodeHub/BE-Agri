@@ -15,6 +15,7 @@ the difference between a safe migration and a data-loss migration.
 from app.db.base import Base
 from app.modules.auth.models import OtpRequest, RefreshToken
 from app.modules.users.models import User, UserRoleAssignment
+from app.modules.vehicles.models import Vehicle, VehicleImage, VehicleType
 
 # Listing them here marks the imports as intentional re-exports, so linters do
 # not flag them as unused.
@@ -24,4 +25,7 @@ __all__ = [
     "RefreshToken",
     "User",
     "UserRoleAssignment",
+    "Vehicle",
+    "VehicleImage",
+    "VehicleType",
 ]

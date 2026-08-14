@@ -19,6 +19,7 @@ keep working until their token expired.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Awaitable, Callable
 
 from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -102,13 +103,16 @@ async def get_active_role(
         raise UnauthorizedError("Invalid authentication token.", code="TOKEN_INVALID") from exc
 
 
-def require_role(role: UserRole) -> object:
+def require_role(role: UserRole) -> Callable[..., Awaitable[User]]:
     """Build a dependency that demands a specific role.
 
-    Used from Phase 2 onward, e.g. provider-only endpoints:
+    Returns the user, so a handler gets authorisation and the row in one line:
 
-        @router.post("/provider/vehicles",
-                     dependencies=[Depends(require_role(UserRole.PROVIDER))])
+        provider_only = require_role(UserRole.PROVIDER)
+
+        @router.post("/provider/vehicles")
+        async def create(provider: User = Depends(provider_only)):
+            ...
 
     Checked against the database, not just the token claim — a token is a hint,
     the database is the truth.

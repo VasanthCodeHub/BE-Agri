@@ -151,6 +151,14 @@ _OPENAPI_TAGS = [
         ),
     },
     {
+        "name": "vehicles",
+        "description": (
+            "Listings. `/provider/vehicles` requires the PROVIDER role and only "
+            "ever touches the caller's own vehicles; `GET /vehicles` is the "
+            "public feed and needs no token."
+        ),
+    },
+    {
         "name": "system",
         "description": (
             "Infrastructure probes, deliberately unversioned — they are not part "
