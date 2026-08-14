@@ -176,6 +176,79 @@ class VehicleCreateIn(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Editing a listing
+# ---------------------------------------------------------------------------
+class VehicleUpdateIn(BaseModel):
+    """Body for PATCH /provider/vehicles/{id}. Every field is optional.
+
+    A **partial** update: only the fields present in the JSON are changed, which
+    is what lets an edit screen send one field without having to resend the
+    other twelve. `exclude_unset` in the service is what makes that work — and
+    it is also why `latitude: null` clears the coordinate while omitting
+    `latitude` leaves it alone. Those two must not mean the same thing.
+
+    `registration_number` is deliberately absent. Changing it would not be
+    editing this listing, it would be pointing the listing at a different
+    physical vehicle — delete and re-list instead.
+    """
+
+    name: str | None = Field(default=None, min_length=2, max_length=120)
+    vehicle_type_code: str | None = Field(default=None, examples=["HARVESTER"])
+    brand: str | None = Field(default=None, min_length=1, max_length=60)
+    model: str | None = Field(default=None, min_length=1, max_length=60)
+    manufacture_year: int | None = Field(default=None, ge=1950, le=2100)
+    note: str | None = Field(default=None, min_length=1, max_length=1000)
+    price_amount: int | None = Field(
+        default=None, gt=0, le=_MAX_PRICE_PAISE, description="In paise. ₹500 = 50000."
+    )
+    price_unit: PriceUnit | None = None
+    location_text: str | None = Field(default=None, min_length=2, max_length=160)
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+    fuel_type: FuelType | None = None
+    power_hp: int | None = Field(default=None, ge=1, le=2000)
+    transmission: Transmission | None = None
+    #: Also settable via PATCH …/availability, which is the one-tap shortcut for
+    #: the listing card. Both write this same column.
+    is_available: bool | None = None
+    #: Sent as a whole set: the new list **replaces** every existing photo, so
+    #: reordering is just sending them in a different order.
+    image_urls: Annotated[
+        list[str] | None, Field(default=None, min_length=MIN_IMAGES, max_length=MAX_IMAGES)
+    ] = None
+
+    @field_validator("vehicle_type_code")
+    @classmethod
+    def _upper_code(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        code = value.strip().upper()
+        if not code:
+            raise ValueError("vehicle_type_code cannot be blank.")
+        return code
+
+    @field_validator("name", "brand", "model", "location_text", "note")
+    @classmethod
+    def _collapse_whitespace(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = " ".join(value.split())
+        if not cleaned:
+            raise ValueError("This field cannot be blank.")
+        return cleaned
+
+    @field_validator("image_urls")
+    @classmethod
+    def _check_urls(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        urls = [_validate_image_url(url) for url in value]
+        if len(set(urls)) != len(urls):
+            raise ValueError("The same image URL is listed more than once.")
+        return urls
+
+
+# ---------------------------------------------------------------------------
 # Output — owner's view
 # ---------------------------------------------------------------------------
 class VehicleOut(BaseModel):

@@ -413,6 +413,327 @@ async def test_the_feed_is_paginated(client: AsyncClient) -> None:
 
 
 # ---------------------------------------------------------------------------
+# My listing, by id — what the edit screen loads
+# ---------------------------------------------------------------------------
+async def test_provider_can_fetch_one_of_their_own_vehicles(client: AsyncClient) -> None:
+    token = await _token(client, "9810000050")
+    vehicle = await _create(client, token, registration_number="TN38GG1111")
+
+    response = await client.get(f"{API}/provider/vehicles/{vehicle['id']}", headers=_auth(token))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == vehicle["id"]
+    # Owner's view: the fields the public card deliberately omits.
+    assert body["registration_number"] == "TN38GG1111"
+    assert body["listing_status"] == "APPROVED"
+
+
+async def test_my_vehicle_by_id_works_when_unavailable(client: AsyncClient) -> None:
+    """The public detail 404s once hidden; the owner must still be able to edit it."""
+    token = await _token(client, "9810000051")
+    vehicle = await _create(client, token, registration_number="TN38GG2222")
+
+    await client.patch(
+        f"{API}/provider/vehicles/{vehicle['id']}/availability",
+        params={"is_available": False},
+        headers=_auth(token),
+    )
+
+    public = await client.get(f"{API}/vehicles/{vehicle['id']}")
+    mine = await client.get(f"{API}/provider/vehicles/{vehicle['id']}", headers=_auth(token))
+
+    assert public.status_code == 404
+    assert mine.status_code == 200
+    assert mine.json()["is_available"] is False
+
+
+async def test_provider_cannot_fetch_another_providers_vehicle_by_id(client: AsyncClient) -> None:
+    owner = await _token(client, "9810000052")
+    stranger = await _token(client, "9810000053")
+    vehicle = await _create(client, owner, registration_number="TN38GG3333")
+
+    response = await client.get(f"{API}/provider/vehicles/{vehicle['id']}", headers=_auth(stranger))
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "VEHICLE_NOT_FOUND"
+
+
+async def test_my_vehicle_by_id_requires_the_provider_role(client: AsyncClient) -> None:
+    provider = await _token(client, "9810000054")
+    renter = await _token(client, "9810000055", role="RENTER")
+    vehicle = await _create(client, provider, registration_number="TN38GG4444")
+
+    anonymous = await client.get(f"{API}/provider/vehicles/{vehicle['id']}")
+    as_renter = await client.get(f"{API}/provider/vehicles/{vehicle['id']}", headers=_auth(renter))
+
+    assert anonymous.status_code == 401
+    assert as_renter.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# Listing detail
+# ---------------------------------------------------------------------------
+async def test_a_single_listing_can_be_fetched_without_a_token(client: AsyncClient) -> None:
+    """The screen a renter lands on after tapping a card."""
+    token = await _token(client, "9810000030")
+    vehicle = await _create(client, token, registration_number="TN38DD1111")
+
+    response = await client.get(f"{API}/vehicles/{vehicle['id']}")
+
+    assert response.status_code == 200
+    card = response.json()
+    assert card["id"] == vehicle["id"]
+    assert card["name"] == "Mahindra 575 DI"
+    assert card["price_label"] == "₹500 / hour"
+
+
+async def test_listing_detail_hides_the_same_fields_as_the_feed(client: AsyncClient) -> None:
+    phone = "9810000031"
+    token = await _token(client, phone)
+    vehicle = await _create(client, token, registration_number="TN38DD2222")
+
+    response = await client.get(f"{API}/vehicles/{vehicle['id']}")
+
+    assert phone not in response.text
+    assert "TN38DD2222" not in response.text
+    card = response.json()
+    assert "registration_number" not in card
+    assert "listing_status" not in card
+
+
+async def test_a_hidden_listing_is_404_by_id_too(client: AsyncClient) -> None:
+    """Hidden from the feed must mean hidden by id — otherwise the id is a
+    back door around the visibility rules."""
+    token = await _token(client, "9810000032")
+    vehicle = await _create(client, token, registration_number="TN38DD3333")
+
+    await client.patch(
+        f"{API}/provider/vehicles/{vehicle['id']}/availability",
+        params={"is_available": False},
+        headers=_auth(token),
+    )
+
+    response = await client.get(f"{API}/vehicles/{vehicle['id']}")
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "VEHICLE_NOT_FOUND"
+
+
+async def test_an_unknown_vehicle_id_is_404(client: AsyncClient) -> None:
+    response = await client.get(f"{API}/vehicles/3f2a4b6c-0000-4000-8000-000000000000")
+
+    assert response.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Editing a listing
+# ---------------------------------------------------------------------------
+async def test_a_provider_can_edit_one_field(client: AsyncClient) -> None:
+    """Partial update: everything not sent must be left alone."""
+    token = await _token(client, "9810000033")
+    vehicle = await _create(client, token, registration_number="TN38EE1111")
+
+    response = await client.patch(
+        f"{API}/provider/vehicles/{vehicle['id']}",
+        json={"price_amount": 60000},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["price_amount"] == 60000
+    assert body["price_label"] == "₹600 / hour"
+    assert body["name"] == vehicle["name"]  # untouched
+    assert body["image_urls"] == vehicle["image_urls"]
+
+
+async def test_editing_can_change_the_vehicle_type(client: AsyncClient) -> None:
+    token = await _token(client, "9810000034")
+    vehicle = await _create(client, token, registration_number="TN38EE2222")
+
+    response = await client.patch(
+        f"{API}/provider/vehicles/{vehicle['id']}",
+        json={"vehicle_type_code": "HARVESTER"},
+        headers=_auth(token),
+    )
+
+    assert response.json()["vehicle_type"]["code"] == "HARVESTER"
+
+
+async def test_editing_with_an_unknown_type_is_rejected(client: AsyncClient) -> None:
+    token = await _token(client, "9810000035")
+    vehicle = await _create(client, token, registration_number="TN38EE3333")
+
+    response = await client.patch(
+        f"{API}/provider/vehicles/{vehicle['id']}",
+        json={"vehicle_type_code": "SPACESHIP"},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "VEHICLE_TYPE_UNKNOWN"
+
+
+async def test_image_urls_are_replaced_as_a_whole_set(client: AsyncClient) -> None:
+    """Replacing three photos with two must leave exactly two, in order.
+
+    This is the case that breaks if the new rows are inserted before the old
+    ones are deleted — sort_order is unique per vehicle.
+    """
+    token = await _token(client, "9810000036")
+    vehicle = await _create(
+        client,
+        token,
+        registration_number="TN38EE4444",
+        image_urls=[f"https://cdn.example.com/{n}.jpg" for n in ("a", "b", "c")],
+    )
+
+    replacement = ["https://cdn.example.com/z.jpg", "https://cdn.example.com/y.jpg"]
+    response = await client.patch(
+        f"{API}/provider/vehicles/{vehicle['id']}",
+        json={"image_urls": replacement},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["image_urls"] == replacement
+
+
+async def test_reordering_photos_is_just_sending_them_in_a_new_order(
+    client: AsyncClient,
+) -> None:
+    token = await _token(client, "9810000037")
+    urls = [f"https://cdn.example.com/{n}.jpg" for n in ("a", "b", "c")]
+    vehicle = await _create(client, token, registration_number="TN38EE5555", image_urls=urls)
+
+    reordered = [urls[2], urls[0], urls[1]]
+    response = await client.patch(
+        f"{API}/provider/vehicles/{vehicle['id']}",
+        json={"image_urls": reordered},
+        headers=_auth(token),
+    )
+
+    assert response.json()["image_urls"] == reordered
+
+
+async def test_omitting_a_coordinate_differs_from_sending_null(client: AsyncClient) -> None:
+    """`latitude: null` clears it; omitting `latitude` must not."""
+    token = await _token(client, "9810000038")
+    vehicle = await _create(
+        client, token, registration_number="TN38EE6666", latitude=11.0246, longitude=77.1252
+    )
+    assert vehicle["latitude"] == 11.0246
+
+    untouched = await client.patch(
+        f"{API}/provider/vehicles/{vehicle['id']}",
+        json={"note": "Updated note."},
+        headers=_auth(token),
+    )
+    assert untouched.json()["latitude"] == 11.0246
+
+    cleared = await client.patch(
+        f"{API}/provider/vehicles/{vehicle['id']}",
+        json={"latitude": None},
+        headers=_auth(token),
+    )
+    assert cleared.json()["latitude"] is None
+
+
+async def test_editing_cannot_change_the_registration_number(client: AsyncClient) -> None:
+    """A different plate is a different vehicle, so the field is not editable.
+
+    `extra` fields are ignored rather than rejected, so the request succeeds and
+    the number simply does not move.
+    """
+    token = await _token(client, "9810000039")
+    vehicle = await _create(client, token, registration_number="TN38EE7777")
+
+    response = await client.patch(
+        f"{API}/provider/vehicles/{vehicle['id']}",
+        json={"registration_number": "TN38EE8888"},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["registration_number"] == "TN38EE7777"
+
+
+async def test_a_provider_cannot_edit_another_providers_vehicle(client: AsyncClient) -> None:
+    owner = await _token(client, "9810000040")
+    stranger = await _token(client, "9810000041")
+    vehicle = await _create(client, owner, registration_number="TN38EE9999")
+
+    response = await client.patch(
+        f"{API}/provider/vehicles/{vehicle['id']}",
+        json={"price_amount": 1},
+        headers=_auth(stranger),
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "VEHICLE_NOT_FOUND"
+
+
+async def test_a_renter_cannot_edit_a_vehicle(client: AsyncClient) -> None:
+    provider = await _token(client, "9810000042")
+    renter = await _token(client, "9810000043", role="RENTER")
+    vehicle = await _create(client, provider, registration_number="TN38FF1111")
+
+    response = await client.patch(
+        f"{API}/provider/vehicles/{vehicle['id']}",
+        json={"price_amount": 1},
+        headers=_auth(renter),
+    )
+
+    assert response.status_code == 403
+
+
+async def test_editing_rejects_implausible_values(client: AsyncClient) -> None:
+    token = await _token(client, "9810000044")
+    vehicle = await _create(client, token, registration_number="TN38FF2222")
+
+    for body in (
+        {"price_amount": 0},
+        {"manufacture_year": 1900},
+        {"power_hp": 99999},
+        {"image_urls": ["http://cdn.example.com/a.jpg"]},
+        {"image_urls": []},
+        {"name": "x"},
+    ):
+        response = await client.patch(
+            f"{API}/provider/vehicles/{vehicle['id']}", json=body, headers=_auth(token)
+        )
+        assert response.status_code == 422, f"{body} was accepted"
+
+
+async def test_an_empty_patch_changes_nothing(client: AsyncClient) -> None:
+    token = await _token(client, "9810000045")
+    vehicle = await _create(client, token, registration_number="TN38FF3333")
+
+    response = await client.patch(
+        f"{API}/provider/vehicles/{vehicle['id']}", json={}, headers=_auth(token)
+    )
+
+    assert response.status_code == 200
+    assert response.json()["price_amount"] == vehicle["price_amount"]
+
+
+async def test_an_edit_is_visible_on_the_public_feed(client: AsyncClient) -> None:
+    """End to end: the provider edits, the renter sees it."""
+    token = await _token(client, "9810000046")
+    vehicle = await _create(client, token, registration_number="TN38FF4444")
+
+    await client.patch(
+        f"{API}/provider/vehicles/{vehicle['id']}",
+        json={"price_amount": 75000, "note": "Price reduced for the season."},
+        headers=_auth(token),
+    )
+
+    card = (await client.get(f"{API}/vehicles/{vehicle['id']}")).json()
+    assert card["price_label"] == "₹750 / hour"
+    assert card["note"] == "Price reduced for the season."
+
+
+# ---------------------------------------------------------------------------
 # Delete
 # ---------------------------------------------------------------------------
 async def test_deleting_removes_the_listing_and_frees_the_registration(

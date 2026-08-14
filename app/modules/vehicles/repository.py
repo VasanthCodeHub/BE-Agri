@@ -105,10 +105,9 @@ class VehicleRepository:
         )
         return await self._page(base, limit=limit, offset=offset)
 
-    async def list_public(
-        self, *, limit: int, offset: int, type_code: str | None = None
-    ) -> tuple[list[Vehicle], int]:
-        """Every discoverable listing, from every provider.
+    @staticmethod
+    def _discoverable() -> Select[Any]:
+        """The base query for anything a renter is allowed to see.
 
         Four conditions decide discoverability, and all four matter:
           - not soft-deleted
@@ -116,8 +115,11 @@ class VehicleRepository:
           - moderation approved it (R9)
           - the owner's account is not suspended — otherwise suspending a
             provider would leave their listings on the feed
+
+        Defined once so the feed and the detail endpoint cannot disagree. If they
+        did, a listing hidden from the feed would still be readable by id.
         """
-        base = (
+        return (
             select(Vehicle)
             .join(User, User.id == Vehicle.provider_user_id)
             .where(
@@ -127,6 +129,17 @@ class VehicleRepository:
                 User.status == UserStatus.ACTIVE,
             )
         )
+
+    async def get_public_by_id(self, vehicle_id: uuid.UUID) -> Vehicle | None:
+        """One listing, but only if a renter is allowed to see it."""
+        result = await self.db.execute(self._discoverable().where(Vehicle.id == vehicle_id))
+        return result.scalars().unique().one_or_none()
+
+    async def list_public(
+        self, *, limit: int, offset: int, type_code: str | None = None
+    ) -> tuple[list[Vehicle], int]:
+        """Every discoverable listing, from every provider."""
+        base = self._discoverable()
         if type_code:
             base = base.join(VehicleType, VehicleType.id == Vehicle.vehicle_type_id).where(
                 VehicleType.code == type_code
@@ -148,6 +161,40 @@ class VehicleRepository:
             base.order_by(Vehicle.created_at.desc(), Vehicle.id).limit(limit).offset(offset)
         )
         return list(result.scalars().unique().all()), int(total or 0)
+
+    # -----------------------------------------------------------------------
+    # Update
+    # -----------------------------------------------------------------------
+    async def apply_updates(
+        self,
+        vehicle: Vehicle,
+        *,
+        fields: dict[str, Any],
+        image_urls: list[str] | None,
+    ) -> Vehicle:
+        """Write the changed columns, and replace the photos if new ones came."""
+        for column, value in fields.items():
+            setattr(vehicle, column, value)
+
+        if image_urls is not None:
+            # Two flushes on purpose. `sort_order` is unique per vehicle, so
+            # inserting the new photos before the old ones are gone would
+            # violate that constraint. Clearing and flushing first sends the
+            # DELETEs, then the INSERTs land on a clean slate.
+            vehicle.images.clear()
+            await self.db.flush()
+            vehicle.images.extend(
+                VehicleImage(url=url, sort_order=index) for index, url in enumerate(image_urls)
+            )
+
+        await self.db.flush()
+        # `updated_at` carries onupdate=func.now(), so it is expired after the
+        # UPDATE — see the note in set_availability. Reload it, and the relations
+        # the response needs, inside the async context.
+        await self.db.refresh(
+            vehicle, attribute_names=["updated_at", "images", "vehicle_type", "provider"]
+        )
+        return vehicle
 
     # -----------------------------------------------------------------------
     # Availability / delete

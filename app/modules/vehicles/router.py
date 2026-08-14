@@ -1,13 +1,16 @@
 """Vehicle listing endpoints.
 
-Three groups, and the difference between them is who may call:
+Two groups, and the difference between them is who may call:
 
   POST   /provider/vehicles                     provider only, own listings
   GET    /provider/vehicles                     provider only, own listings
+  GET    /provider/vehicles/{id}                provider only, own listings
+  PATCH  /provider/vehicles/{id}                provider only, own listings
   PATCH  /provider/vehicles/{id}/availability   provider only, own listings
   DELETE /provider/vehicles/{id}                provider only, own listings
 
   GET    /vehicles                              public — no token needed
+  GET    /vehicles/{id}                         public — no token needed
   GET    /vehicle-types                         public — the app's picker
 
 The public feed is deliberately unauthenticated (Q11: browsing is anonymous,
@@ -26,11 +29,13 @@ from app.modules.auth.dependencies import require_role
 from app.modules.users.models import User, UserRole
 from app.modules.vehicles.repository import VehicleRepository
 from app.modules.vehicles.schemas import (
+    VehicleCardOut,
     VehicleCardPage,
     VehicleCreateIn,
     VehicleOut,
     VehiclePage,
     VehicleTypeOut,
+    VehicleUpdateIn,
 )
 from app.modules.vehicles.service import VehicleService
 
@@ -129,6 +134,72 @@ async def list_my_vehicles(
     return await service.list_my_vehicles(provider=provider, limit=limit, offset=offset)
 
 
+@router.get(
+    "/provider/vehicles/{vehicle_id}",
+    response_model=VehicleOut,
+    tags=["vehicles"],
+    summary="One of my vehicles",
+    responses={
+        401: {"description": "Missing or invalid token"},
+        403: {"description": "Caller does not hold the PROVIDER role"},
+        404: {"description": "Not found, or not owned by the caller"},
+    },
+)
+async def get_my_vehicle(
+    vehicle_id: uuid.UUID,
+    provider: User = Depends(provider_only),
+    service: VehicleService = Depends(get_vehicle_service),
+) -> VehicleOut:
+    """One of your own listings — what an edit screen loads to prefill its form.
+
+    Returns the **owner's** view, so unlike `GET /vehicles/{id}` it includes the
+    registration number and the moderation status, and it works regardless of
+    whether the listing is currently available or approved.
+
+    404 (not 403) for someone else's vehicle: a 403 would confirm the id is real,
+    which is how one provider enumerates another's inventory.
+    """
+    return await service.get_my_vehicle(provider=provider, vehicle_id=vehicle_id)
+
+
+@router.patch(
+    "/provider/vehicles/{vehicle_id}",
+    response_model=VehicleOut,
+    tags=["vehicles"],
+    summary="Edit a vehicle",
+    responses={
+        400: {"description": "Unknown vehicle type"},
+        403: {"description": "Caller does not hold the PROVIDER role"},
+        404: {"description": "Not found, or not owned by the caller"},
+        422: {"description": "A field is invalid"},
+    },
+)
+async def update_vehicle(
+    vehicle_id: uuid.UUID,
+    payload: VehicleUpdateIn,
+    provider: User = Depends(provider_only),
+    service: VehicleService = Depends(get_vehicle_service),
+) -> VehicleOut:
+    """Change one of your own listings. **Partial** — send only what changed.
+
+    ```json
+    { "price_amount": 60000 }
+    ```
+
+    Two things worth knowing:
+
+    - **`image_urls` replaces the whole set.** Send all the photos you want to
+      keep, in the order you want them; the first is the card thumbnail. Omit the
+      field to leave the photos untouched.
+    - **`latitude: null` clears the coordinate**, while omitting `latitude`
+      leaves it as it was. Those are different requests.
+
+    `registration_number` cannot be changed — that would point the listing at a
+    different physical vehicle. Delete it and create a new listing instead.
+    """
+    return await service.update_vehicle(provider=provider, vehicle_id=vehicle_id, payload=payload)
+
+
 @router.patch(
     "/provider/vehicles/{vehicle_id}/availability",
     response_model=VehicleOut,
@@ -207,3 +278,27 @@ async def list_available_vehicles(
     return await service.list_available_vehicles(
         limit=limit, offset=offset, type_code=type_code.strip().upper() if type_code else None
     )
+
+
+@router.get(
+    "/vehicles/{vehicle_id}",
+    response_model=VehicleCardOut,
+    tags=["vehicles"],
+    summary="One vehicle's details",
+    responses={404: {"description": "No such vehicle, or it is not discoverable"}},
+)
+async def get_vehicle(
+    vehicle_id: uuid.UUID,
+    service: VehicleService = Depends(get_vehicle_service),
+) -> VehicleCardOut:
+    """The listing behind a card on the feed. **No login required.**
+
+    Same visibility rules as `GET /vehicles`: a listing that is deleted,
+    unavailable, unapproved, or owned by a suspended provider returns **404**
+    here too. Hidden from the feed means hidden by id as well.
+
+    Carries **no provider phone number** and **no registration number**. To
+    contact the owner, use `provider_id` with the masked-calling endpoint
+    (Phase 7).
+    """
+    return await service.get_public_vehicle(vehicle_id=vehicle_id)

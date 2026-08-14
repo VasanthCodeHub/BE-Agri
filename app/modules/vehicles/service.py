@@ -23,6 +23,7 @@ from app.modules.vehicles.schemas import (
     VehicleOut,
     VehiclePage,
     VehicleTypeOut,
+    VehicleUpdateIn,
 )
 
 log = get_logger(__name__)
@@ -106,6 +107,16 @@ class VehicleService:
             offset=offset,
         )
 
+    async def get_my_vehicle(self, *, provider: User, vehicle_id: uuid.UUID) -> VehicleOut:
+        """One of the caller's own listings, in the owner's view.
+
+        Unlike the public detail endpoint this returns the listing whatever its
+        state — unavailable, or not yet approved — because the owner needs to see
+        and edit exactly what they have.
+        """
+        vehicle = await self._own_vehicle(provider=provider, vehicle_id=vehicle_id)
+        return VehicleOut.from_model(vehicle)
+
     # -----------------------------------------------------------------------
     # Read — the public feed
     # -----------------------------------------------------------------------
@@ -121,6 +132,55 @@ class VehicleService:
             limit=limit,
             offset=offset,
         )
+
+    async def get_public_vehicle(self, *, vehicle_id: uuid.UUID) -> VehicleCardOut:
+        """One listing, for the renter who tapped its card.
+
+        404 for anything not discoverable — deleted, unavailable, unapproved, or
+        belonging to a suspended provider. A listing that is hidden from the feed
+        must not be readable by id either.
+        """
+        vehicle = await self.repo.get_public_by_id(vehicle_id)
+        if vehicle is None:
+            raise NotFoundError("Vehicle not found.", code="VEHICLE_NOT_FOUND")
+        return VehicleCardOut.from_model(vehicle)
+
+    # -----------------------------------------------------------------------
+    # Update
+    # -----------------------------------------------------------------------
+    async def update_vehicle(
+        self, *, provider: User, vehicle_id: uuid.UUID, payload: VehicleUpdateIn
+    ) -> VehicleOut:
+        """Apply a partial update to one of the caller's own listings."""
+        vehicle = await self._own_vehicle(provider=provider, vehicle_id=vehicle_id)
+
+        # exclude_unset is the whole point: it separates "the client did not
+        # mention latitude" from "the client sent latitude: null to clear it".
+        changes = payload.model_dump(exclude_unset=True)
+        image_urls = changes.pop("image_urls", None)
+        type_code = changes.pop("vehicle_type_code", None)
+
+        if type_code is not None:
+            vehicle_type = await self.repo.get_type_by_code(type_code)
+            if vehicle_type is None:
+                raise BadRequestError(
+                    f"Unknown vehicle type {type_code!r}. "
+                    "Fetch the valid codes from GET /vehicle-types.",
+                    code="VEHICLE_TYPE_UNKNOWN",
+                    details={"vehicle_type_code": type_code},
+                )
+            changes["vehicle_type_id"] = vehicle_type.id
+
+        vehicle = await self.repo.apply_updates(vehicle, fields=changes, image_urls=image_urls)
+
+        log.info(
+            "vehicle_updated",
+            vehicle_id=str(vehicle.id),
+            provider_id=str(provider.id),
+            changed=sorted(changes),
+            images_replaced=image_urls is not None,
+        )
+        return VehicleOut.from_model(vehicle)
 
     # -----------------------------------------------------------------------
     # Availability and delete
