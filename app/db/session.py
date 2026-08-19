@@ -14,6 +14,7 @@ database running.
 
 from __future__ import annotations
 
+import ssl
 from collections.abc import AsyncIterator
 
 from sqlalchemy import text
@@ -33,6 +34,13 @@ _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 
 
+def _make_ssl_context() -> ssl.SSLContext:
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
 def get_engine() -> AsyncEngine:
     """Return the process-wide engine, creating it on first use."""
     global _engine
@@ -40,13 +48,11 @@ def get_engine() -> AsyncEngine:
         settings = get_settings()
         _engine = create_async_engine(
             settings.database_url,
-            echo=settings.db_echo,  # True logs every SQL statement — noisy but great for learning
+            echo=settings.db_echo,
             pool_size=settings.db_pool_size,
             max_overflow=settings.db_max_overflow,
             pool_timeout=settings.db_pool_timeout,
-            # Sends a cheap "SELECT 1" before handing out a pooled connection.
-            # Without it, a connection dropped by the database (restart,
-            # idle timeout) is handed to your code and fails the request.
+            connect_args={"ssl": _make_ssl_context()},
             pool_pre_ping=True,
         )
         log.debug("db_engine_created", pool_size=settings.db_pool_size)
