@@ -1,17 +1,13 @@
-"""Data access for vehicle listings.
-
-Every query lives here. As in the auth module, nothing in this file commits —
-`get_db` owns the transaction, so a request that fails halfway leaves no
-half-created listing with three of its six photos.
-"""
+"""Data access for vehicle listings."""
 
 from __future__ import annotations
 
 import uuid
 from typing import Any
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.security import utc_now
 from app.modules.users.models import User, UserStatus
@@ -46,13 +42,6 @@ class VehicleRepository:
     # Writes
     # -----------------------------------------------------------------------
     async def registration_is_taken(self, registration_number: str) -> bool:
-        """Is this number already on a live listing?
-
-        The database enforces this too (partial unique index). Checking here as
-        well lets the API answer with a clear 409 instead of a raw
-        IntegrityError, while the index remains the actual guarantee against two
-        concurrent requests.
-        """
         result = await self.db.execute(
             select(Vehicle.id).where(
                 Vehicle.registration_number == registration_number,
@@ -67,26 +56,30 @@ class VehicleRepository:
             for index, public_id in enumerate(public_ids)
         ]
         self.db.add(vehicle)
-        # flush, not commit: assigns the id and makes the relationships usable
-        # within this request while staying inside the transaction.
         await self.db.flush()
-        # Load vehicle_type / provider so the response can be built without a
-        # lazy load during serialisation (which would raise MissingGreenlet).
         await self.db.refresh(vehicle, attribute_names=["vehicle_type", "provider", "images"])
         return vehicle
 
     # -----------------------------------------------------------------------
-    # Reads
+    # Counts
+    # -----------------------------------------------------------------------
+    async def count_for_provider(self, *, provider_user_id: uuid.UUID) -> int:
+        result = await self.db.execute(
+            select(func.count())
+            .select_from(Vehicle)
+            .where(
+                Vehicle.provider_user_id == provider_user_id,
+                Vehicle.deleted_at.is_(None),
+            )
+        )
+        return int(result.scalar() or 0)
+
+    # -----------------------------------------------------------------------
+    # Reads — owner
     # -----------------------------------------------------------------------
     async def get_owned(
         self, *, vehicle_id: uuid.UUID, provider_user_id: uuid.UUID
     ) -> Vehicle | None:
-        """One of *this* provider's vehicles.
-
-        Ownership is part of the WHERE clause rather than a check afterwards, so
-        a mistyped id and someone else's id are indistinguishable to the caller
-        — no probing for which listings exist.
-        """
         result = await self.db.execute(
             select(Vehicle).where(
                 Vehicle.id == vehicle_id,
@@ -99,30 +92,22 @@ class VehicleRepository:
     async def list_for_provider(
         self, *, provider_user_id: uuid.UUID, limit: int, offset: int
     ) -> tuple[list[Vehicle], int]:
-        """This provider's listings, newest first — including unavailable ones."""
         base = select(Vehicle).where(
             Vehicle.provider_user_id == provider_user_id,
             Vehicle.deleted_at.is_(None),
         )
         return await self._page(base, limit=limit, offset=offset)
 
+    # -----------------------------------------------------------------------
+    # Reads — public feed
+    # -----------------------------------------------------------------------
     @staticmethod
     def _discoverable() -> Select[Any]:
-        """The base query for anything a renter is allowed to see.
-
-        Four conditions decide discoverability, and all four matter:
-          - not soft-deleted
-          - the owner marked it available
-          - moderation approved it (R9)
-          - the owner's account is not suspended — otherwise suspending a
-            provider would leave their listings on the feed
-
-        Defined once so the feed and the detail endpoint cannot disagree. If they
-        did, a listing hidden from the feed would still be readable by id.
-        """
+        """Base query for anything a renter is allowed to see."""
         return (
             select(Vehicle)
             .join(User, User.id == Vehicle.provider_user_id)
+            .options(selectinload(Vehicle.provider), selectinload(Vehicle.vehicle_type))
             .where(
                 Vehicle.deleted_at.is_(None),
                 Vehicle.is_available.is_(True),
@@ -132,29 +117,139 @@ class VehicleRepository:
         )
 
     async def get_public_by_id(self, vehicle_id: uuid.UUID) -> Vehicle | None:
-        """One listing, but only if a renter is allowed to see it."""
-        result = await self.db.execute(self._discoverable().where(Vehicle.id == vehicle_id))
+        result = await self.db.execute(
+            self._discoverable().where(Vehicle.id == vehicle_id)
+        )
         return result.scalars().unique().one_or_none()
 
     async def list_public(
-        self, *, limit: int, offset: int, type_code: str | None = None
-    ) -> tuple[list[Vehicle], int]:
-        """Every discoverable listing, from every provider."""
+        self,
+        *,
+        limit: int,
+        offset: int,
+        type_code: str | None = None,
+        lat: float | None = None,
+        lng: float | None = None,
+        radius_km: float | None = None,
+        q: str | None = None,
+        max_price: int | None = None,
+        sort: str = "newest",
+    ) -> tuple[list[tuple[Vehicle, float | None]], int]:
+        """Discoverable listings, optionally geo-filtered.
+
+        Returns a list of (vehicle, distance_km) tuples so the router can
+        attach distance to each card without another query.
+        """
         base = self._discoverable()
+
+        # Vehicle type filter
         if type_code:
             base = base.join(VehicleType, VehicleType.id == Vehicle.vehicle_type_id).where(
                 VehicleType.code == type_code
             )
-        return await self._page(base, limit=limit, offset=offset)
 
+        # Text search on name, brand, note, location_text
+        if q:
+            pattern = f"%{q.strip().lower()}%"
+            base = base.where(
+                func.lower(Vehicle.name).like(pattern)
+                | func.lower(Vehicle.brand).like(pattern)
+                | func.lower(Vehicle.note).like(pattern)
+                | func.lower(Vehicle.location_text).like(pattern)
+            )
+
+        # Price filter
+        if max_price is not None:
+            base = base.where(Vehicle.price_amount <= max_price)
+
+        # --- ordering (before distance so we can still count) ---
+        if sort == "price_asc":
+            order = [Vehicle.price_amount.asc()]
+        elif sort == "price_desc":
+            order = [Vehicle.price_amount.desc()]
+        elif sort == "distance":
+            order = [Vehicle.created_at.desc()]  # fallback; distance needs geo
+        else:
+            order = [Vehicle.created_at.desc(), Vehicle.id]
+
+        # Total count (before adding geo SELECT)
+        count_subq = base.order_by(None).subquery()
+        total = await self.db.scalar(select(func.count()).select_from(count_subq))
+
+        # --- Geo filter ---
+        # Use ST_Simplify or a plain point check. We store lat/lng separately,
+        # so ST_SetSRID(ST_MakePoint(longitude, latitude), 4326) is the geo point.
+        # ST_DWithin uses geography distance in metres when both operands are geography.
+        if lat is not None and lng is not None:
+            point_clause = text(
+                "ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography"
+            )
+            base = base.where(
+                Vehicle.latitude.is_not(None),
+                Vehicle.longitude.is_not(None),
+            )
+            if radius_km is not None:
+                radius_m = radius_km * 1000
+                base = base.where(
+                    text(
+                        "ST_DWithin("
+                        "  ST_SetSRID(ST_MakePoint(vehicles.longitude, vehicles.latitude), 4326)::geography,"
+                        "  ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography,"
+                        f" {radius_m}"
+                        ")"
+                    )
+                )
+
+            # Add distance to SELECT
+            if sort == "distance":
+                dist_expr = text(
+                    "ST_Distance("
+                    "  ST_SetSRID(ST_MakePoint(vehicles.longitude, vehicles.latitude), 4326)::geography,"
+                    "  ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography"
+                    ") / 1000.0"
+                )
+            else:
+                dist_expr = None
+        else:
+            point_clause = None
+            dist_expr = None
+
+        # Build column list
+        if dist_expr is not None:
+            select_cols = [Vehicle, dist_expr.label("distance_km")]
+        else:
+            select_cols = [Vehicle]
+
+        stmt = select(*select_cols).select_from(base)
+
+        if sort == "distance" and dist_expr is not None:
+            stmt = stmt.order_by(text("distance_km NULLS LAST"), Vehicle.created_at.desc())
+        else:
+            stmt = stmt.order_by(*order)
+
+        stmt = stmt.limit(limit).offset(offset)
+
+        params = {"lat": lat, "lng": lng}
+        result = await self.db.execute(stmt, params)
+        rows = result.unique().all()
+
+        vehicles: list[tuple[Vehicle, float | None]] = []
+        for row in rows:
+            if dist_expr is not None:
+                vehicle = row[0]
+                dist_val = row.distance_km  # type: ignore[attr-defined]
+                vehicles.append((vehicle, round(float(dist_val), 2) if dist_val is not None else None))
+            else:
+                vehicles.append((row[0], None))
+
+        return vehicles, int(total or 0)
+
+    # -----------------------------------------------------------------------
+    # Pagination
+    # -----------------------------------------------------------------------
     async def _page(
         self, base: Select[Any], *, limit: int, offset: int
     ) -> tuple[list[Vehicle], int]:
-        """Run a paginated query plus its total count.
-
-        The count reuses the same filters via a subquery, so the two can never
-        drift apart when a filter is added.
-        """
         total = await self.db.scalar(
             select(func.count()).select_from(base.order_by(None).subquery())
         )
@@ -173,15 +268,10 @@ class VehicleRepository:
         fields: dict[str, Any],
         public_ids: list[str] | None,
     ) -> Vehicle:
-        """Write the changed columns, and replace the photos if new ones came."""
         for column, value in fields.items():
             setattr(vehicle, column, value)
 
         if public_ids is not None:
-            # Two flushes on purpose. `sort_order` is unique per vehicle, so
-            # inserting the new photos before the old ones are gone would
-            # violate that constraint. Clearing and flushing first sends the
-            # DELETEs, then the INSERTs land on a clean slate.
             vehicle.images.clear()
             await self.db.flush()
             vehicle.images.extend(
@@ -190,9 +280,6 @@ class VehicleRepository:
             )
 
         await self.db.flush()
-        # `updated_at` carries onupdate=func.now(), so it is expired after the
-        # UPDATE — see the note in set_availability. Reload it, and the relations
-        # the response needs, inside the async context.
         await self.db.refresh(
             vehicle, attribute_names=["updated_at", "images", "vehicle_type", "provider"]
         )
@@ -204,14 +291,8 @@ class VehicleRepository:
     async def set_availability(self, vehicle: Vehicle, *, is_available: bool) -> None:
         vehicle.is_available = is_available
         await self.db.flush()
-        # `updated_at` carries onupdate=func.now(), so the UPDATE leaves it
-        # expired — PostgreSQL returns server defaults for INSERTs via RETURNING
-        # but not for UPDATEs. Reading it while building the response would then
-        # lazy-load, and a lazy load during serialisation raises MissingGreenlet
-        # in async SQLAlchemy. Fetch it here, inside the async context.
         await self.db.refresh(vehicle, attribute_names=["updated_at"])
 
     async def soft_delete(self, vehicle: Vehicle) -> None:
-        """Mark deleted. Frees the registration number for re-listing."""
         vehicle.deleted_at = utc_now()
         await self.db.flush()

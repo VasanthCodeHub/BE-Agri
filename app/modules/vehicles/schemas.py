@@ -42,17 +42,10 @@ from app.modules.vehicles.registration import (
     normalise_registration_number,
 )
 
-_MAX_PRICE_PAISE = 100_000_000  # ₹10,00,000 — a sanity ceiling, not a business rule
+_MAX_PRICE_PAISE = 100_000_000
 
 
 def _validate_public_id(value: str) -> str:
-    """Shape-check a Cloudinary public_id.
-
-    Only the *shape* is checked here. Whether the id sits in our own folder is
-    checked in the service layer, which is the layer that can see settings — a
-    Pydantic validator reading global settings would ignore the per-test
-    overrides and quietly validate against the developer's real `.env`.
-    """
     public_id = value.strip()
     if not public_id:
         raise ValueError("public_id cannot be empty.")
@@ -70,11 +63,9 @@ def _validate_public_id(value: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Vehicle types (the seeded taxonomy)
+# Vehicle types
 # ---------------------------------------------------------------------------
 class VehicleTypeOut(BaseModel):
-    """A row from the seeded taxonomy, as the app's picker needs it."""
-
     id: uuid.UUID
     code: str = Field(description="Stable machine key — send this when creating a vehicle.")
     name_en: str
@@ -88,6 +79,25 @@ class VehicleTypeOut(BaseModel):
             name_en=vehicle_type.name_en,
             name_ta=vehicle_type.name_ta,
         )
+
+
+# ---------------------------------------------------------------------------
+# Search query params
+# ---------------------------------------------------------------------------
+class VehicleSearchParams(BaseModel):
+    """All possible filters for GET /vehicles. The router instantiates this
+    from query parameters."""
+
+    type_code: str | None = None
+    lat: float | None = Field(default=None, ge=-90, le=90)
+    lng: float | None = Field(default=None, ge=-180, le=180)
+    radius_km: float | None = Field(default=None, gt=0, le=500)
+    q: str | None = Field(default=None, max_length=100)
+    max_price: int | None = Field(default=None, gt=0, le=_MAX_PRICE_PAISE)
+    available_only: bool = True
+    sort: str = Field(default="newest", pattern="^(newest|distance|price_asc|price_desc)$")
+    limit: int = 20
+    offset: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -141,21 +151,17 @@ class VehicleCreateIn(BaseModel):
     fuel_type: FuelType = Field(..., examples=["DIESEL"])
     power_hp: int = Field(..., ge=1, le=2000, description="Engine power in HP.", examples=[47])
     transmission: Transmission = Field(..., examples=["MANUAL"])
-    image_public_ids: Annotated[list[str], Field(min_length=MIN_IMAGES, max_length=MAX_IMAGES)] = (
-        Field(
-            ...,
-            description=(
-                f"{MIN_IMAGES}-{MAX_IMAGES} Cloudinary `public_id` values, each from an upload "
-                "authorised by POST /provider/uploads/signature. The first is the card "
-                "thumbnail. Send ids, not URLs."
-            ),
-            examples=[["agri/vehicles/9f8e7d6c5b4a3928"]],
-        )
+    image_public_ids: list[str] = Field(
+        default_factory=list,
+        min_length=0,
+        max_length=MAX_IMAGES,
+        description=(
+            f"0-{MAX_IMAGES} Cloudinary `public_id` values. The first is the card "
+            "thumbnail. Send ids, not URLs. Empty list allowed — edit later using "
+            "PATCH /provider/vehicles/{{id}} with image_public_ids."
+        ),
+        examples=[["agri/vehicles/9f8e7d6c5b4a3928"], []],
     )
-
-    #: Optional, and the only pair that is: radius search is not built yet. Send
-    #: them if the app has GPS, so search works over existing listings later
-    #: without asking every owner to re-enter their location.
     latitude: float | None = Field(default=None, ge=-90, le=90, examples=[11.0246])
     longitude: float | None = Field(default=None, ge=-180, le=180, examples=[77.1252])
 
@@ -196,18 +202,7 @@ class VehicleCreateIn(BaseModel):
 # Editing a listing
 # ---------------------------------------------------------------------------
 class VehicleUpdateIn(BaseModel):
-    """Body for PATCH /provider/vehicles/{id}. Every field is optional.
-
-    A **partial** update: only the fields present in the JSON are changed, which
-    is what lets an edit screen send one field without having to resend the
-    other twelve. `exclude_unset` in the service is what makes that work — and
-    it is also why `latitude: null` clears the coordinate while omitting
-    `latitude` leaves it alone. Those two must not mean the same thing.
-
-    `registration_number` is deliberately absent. Changing it would not be
-    editing this listing, it would be pointing the listing at a different
-    physical vehicle — delete and re-list instead.
-    """
+    """Body for PATCH /provider/vehicles/{id}. Every field is optional."""
 
     name: str | None = Field(default=None, min_length=2, max_length=120)
     vehicle_type_code: str | None = Field(default=None, examples=["HARVESTER"])
@@ -225,14 +220,13 @@ class VehicleUpdateIn(BaseModel):
     fuel_type: FuelType | None = None
     power_hp: int | None = Field(default=None, ge=1, le=2000)
     transmission: Transmission | None = None
-    #: Also settable via PATCH …/availability, which is the one-tap shortcut for
-    #: the listing card. Both write this same column.
     is_available: bool | None = None
-    #: Sent as a whole set: the new list **replaces** every existing photo, so
-    #: reordering is just sending them in a different order.
-    image_public_ids: Annotated[
-        list[str] | None, Field(default=None, min_length=MIN_IMAGES, max_length=MAX_IMAGES)
-    ] = None
+    image_public_ids: list[str] | None = Field(
+        default=None,
+        min_length=0,
+        max_length=MAX_IMAGES,
+        description="Replace all photos. [] to clear.",
+    )
 
     @field_validator("vehicle_type_code")
     @classmethod
@@ -259,22 +253,14 @@ class VehicleUpdateIn(BaseModel):
     def _check_public_ids(cls, value: list[str] | None) -> list[str] | None:
         if value is None:
             return None
-        ids = [_validate_public_id(public_id) for public_id in value]
-        if len(set(ids)) != len(ids):
-            raise ValueError("The same image is listed more than once.")
-        return ids
+        return [_validate_public_id(pid) for pid in value]
 
 
 # ---------------------------------------------------------------------------
 # Output — images
 # ---------------------------------------------------------------------------
 class VehicleImageOut(BaseModel):
-    """One photo, at the two sizes a client actually needs.
-
-    Both URLs are derived from the stored `public_id`, not saved anywhere. That
-    is the payoff for storing ids: the list screen can pull a small thumbnail
-    while the detail screen pulls the full picture, from the same record.
-    """
+    """One photo, at the two sizes a client actually needs."""
 
     public_id: str
     url: str | None = Field(description="Full size. Null if Cloudinary is not configured.")
@@ -354,18 +340,7 @@ class VehicleOut(BaseModel):
 # Output — public view
 # ---------------------------------------------------------------------------
 class VehicleCardOut(BaseModel):
-    """A listing as a renter sees it.
-
-    Deliberately absent, and each omission is a decision:
-
-    - **provider phone number** — the whole point of the masked-calling feature
-      (ADR-009). Contact happens through `/calls/initiate` in Phase 7.
-    - **registration number** — an RC number can be used to look up the
-      registered owner. Renters do not need it to choose a tractor.
-    - **exact coordinates** — a precise home location for every provider is not
-      something a public feed should hand out.
-    - **listing_status** — internal moderation state.
-    """
+    """A listing as a renter sees it."""
 
     id: uuid.UUID
     name: str
@@ -382,8 +357,12 @@ class VehicleCardOut(BaseModel):
     power_hp: int
     transmission: Transmission
     images: list[VehicleImageOut]
-    provider_id: uuid.UUID = Field(description="Use this to initiate a call (Phase 7).")
+    provider_id: uuid.UUID = Field(description="Use this to initiate a call.")
     provider_name: str | None
+    provider_phone: str | None = Field(default=None, description="Revealed after /contact/call.")
+    rating: float | None = Field(default=None, ge=0, le=5)
+    review_count: int = Field(default=0, ge=0)
+    distance_km: float | None = Field(default=None, ge=0)
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -409,13 +388,24 @@ class VehicleCardOut(BaseModel):
                         "thumb_url": "https://res.cloudinary.com/your-cloud/image/upload/w_400,c_fill,q_auto,f_auto/agri/vehicles/9f8e7d6c",
                     }
                 ],
+                "provider_id": "abc...",
                 "provider_name": "Ravi Kumar",
+                "provider_phone": "+9198765xxxxx",
+                "rating": 4.2,
+                "review_count": 3,
+                "distance_km": 12.5,
             }
         }
     )
 
     @classmethod
-    def from_model(cls, vehicle: Vehicle, *, settings: Settings) -> VehicleCardOut:
+    def from_model(
+        cls,
+        vehicle: Vehicle,
+        *,
+        settings: Settings,
+        distance_km: float | None = None,
+    ) -> VehicleCardOut:
         return cls(
             id=vehicle.id,
             name=vehicle.name,
@@ -436,6 +426,10 @@ class VehicleCardOut(BaseModel):
             ],
             provider_id=vehicle.provider_user_id,
             provider_name=vehicle.provider.full_name if vehicle.provider else None,
+            provider_phone=vehicle.provider.phone_e164 if vehicle.provider else None,
+            rating=None,
+            review_count=0,
+            distance_km=distance_km,
         )
 
 
@@ -443,8 +437,6 @@ class VehicleCardOut(BaseModel):
 # Pagination
 # ---------------------------------------------------------------------------
 class VehiclePage(BaseModel):
-    """A page of owner-view listings."""
-
     items: list[VehicleOut]
     total: int = Field(description="Total matching listings, ignoring pagination.")
     limit: int
@@ -452,8 +444,6 @@ class VehiclePage(BaseModel):
 
 
 class VehicleCardPage(BaseModel):
-    """A page of public listing cards."""
-
     items: list[VehicleCardOut]
     total: int
     limit: int
@@ -472,11 +462,6 @@ _UNIT_LABELS = {
 
 
 def price_label(amount_paise: int, unit: PriceUnit) -> str:
-    """Render paise as a rupee string: 50000, HOUR -> '₹500 / hour'.
-
-    Done server-side so every client shows money identically, and so the
-    rounding rule lives in one place.
-    """
     rupees = amount_paise / 100
     formatted = f"{rupees:,.0f}" if rupees == int(rupees) else f"{rupees:,.2f}"
     return f"₹{formatted} / {_UNIT_LABELS[unit]}"

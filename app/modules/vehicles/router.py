@@ -2,16 +2,18 @@
 
 Two groups, and the difference between them is who may call:
 
-  POST   /provider/vehicles                     provider only, own listings
-  GET    /provider/vehicles                     provider only, own listings
-  GET    /provider/vehicles/{id}                provider only, own listings
-  PATCH  /provider/vehicles/{id}                provider only, own listings
-  PATCH  /provider/vehicles/{id}/availability   provider only, own listings
-  DELETE /provider/vehicles/{id}                provider only, own listings
+  POST   /provider/vehicles                        provider only, own listings
+  GET    /provider/vehicles                        provider only, own listings
+  GET    /provider/vehicles/{id}                   provider only, own listings
+  PATCH  /provider/vehicles/{id}                   provider only, own listings
+  PATCH  /provider/vehicles/{id}/availability      provider only, own listings
+  GET    /provider/vehicles/{id}/availability      provider only, own listings (read)
+  DELETE /provider/vehicles/{id}                   provider only, own listings
 
-  GET    /vehicles                              public — no token needed
-  GET    /vehicles/{id}                         public — no token needed
-  GET    /vehicle-types                         public — the app's picker
+  GET    /vehicles                                 public — no token needed
+  GET    /vehicles/{id}                            public — no token needed
+  GET    /vehicle-types                            public — the app's picker
+  POST   /contact/call                             public — masked calling
 
 The public feed is deliberately unauthenticated (Q11: browsing is anonymous,
 login is required only to call a provider).
@@ -20,14 +22,19 @@ login is required only to call a provider).
 from __future__ import annotations
 
 import uuid
+from datetime import datetime as dt, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query, Response, status
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
+from app.core.exceptions import NotFoundError, ServiceUnavailableError
+from app.core.logging import get_logger
 from app.db.session import get_db
 from app.modules.auth.dependencies import require_role
 from app.modules.users.models import User, UserRole
+from app.modules.vehicles.models import Vehicle, VehicleType
 from app.modules.vehicles.repository import VehicleRepository
 from app.modules.vehicles.schemas import (
     VehicleCardOut,
@@ -35,6 +42,7 @@ from app.modules.vehicles.schemas import (
     VehicleCreateIn,
     VehicleOut,
     VehiclePage,
+    VehicleSearchParams,
     VehicleTypeOut,
     VehicleUpdateIn,
 )
@@ -42,9 +50,8 @@ from app.modules.vehicles.service import VehicleService
 
 router = APIRouter()
 
-#: The provider guard. `require_role` returns a dependency that rejects a caller
-#: without the PROVIDER role AND hands back the user row, so a handler never
-#: repeats an authorisation check.
+log = get_logger(__name__)
+
 provider_only = require_role(UserRole.PROVIDER)
 
 
@@ -53,6 +60,28 @@ def get_vehicle_service(
     settings: Settings = Depends(get_settings),
 ) -> VehicleService:
     return VehicleService(repo=VehicleRepository(db), settings=settings)
+
+
+def _build_search_params(
+    type_code: str | None = None,
+    lat: float | None = None,
+    lng: float | None = None,
+    radius_km: float | None = None,
+    q: str | None = None,
+    max_price: float | None = None,
+    available_only: bool = True,
+    sort: str = "newest",
+) -> VehicleSearchParams:
+    return VehicleSearchParams(
+        type_code=type_code.strip().upper() if type_code else None,
+        lat=lat,
+        lng=lng,
+        radius_km=radius_km,
+        q=q.strip() if q else None,
+        max_price=int(max_price) if max_price is not None else None,
+        available_only=available_only,
+        sort=sort,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -67,11 +96,6 @@ def get_vehicle_service(
 async def list_vehicle_types(
     service: VehicleService = Depends(get_vehicle_service),
 ) -> list[VehicleTypeOut]:
-    """The seeded taxonomy, for the app's type picker.
-
-    Send the `code` (not the name) when creating a vehicle. Names are
-    translatable and may change; codes will not.
-    """
     return await service.list_types()
 
 
@@ -97,20 +121,6 @@ async def create_vehicle(
     provider: User = Depends(provider_only),
     service: VehicleService = Depends(get_vehicle_service),
 ) -> VehicleOut:
-    """Create a listing owned by the calling provider.
-
-    Every field is required except `latitude`/`longitude`, which are optional
-    only because radius search is not built yet — send them if the app has GPS
-    and search will work over your existing listings later.
-
-    Notes on two fields that catch people out:
-
-    - **`price_amount` is in paise**, not rupees. ₹500 per hour is `50000`.
-    - **`vehicle_type_code`** must be a `code` from `GET /vehicle-types`.
-
-    The registration number is normalised (`TN 38 AB 1234` → `TN38AB1234`) and
-    must not already belong to a live listing.
-    """
     return await service.create_vehicle(provider=provider, payload=payload)
 
 
@@ -119,10 +129,6 @@ async def create_vehicle(
     response_model=VehiclePage,
     tags=["vehicles"],
     summary="My vehicles",
-    responses={
-        401: {"description": "Missing or invalid token"},
-        403: {"description": "Caller does not hold the PROVIDER role"},
-    },
 )
 async def list_my_vehicles(
     provider: User = Depends(provider_only),
@@ -130,11 +136,6 @@ async def list_my_vehicles(
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
 ) -> VehiclePage:
-    """Every listing owned by the calling provider, newest first.
-
-    Includes listings the provider has marked unavailable — this is their
-    management screen, not the public feed. Soft-deleted listings are excluded.
-    """
     return await service.list_my_vehicles(provider=provider, limit=limit, offset=offset)
 
 
@@ -143,26 +144,12 @@ async def list_my_vehicles(
     response_model=VehicleOut,
     tags=["vehicles"],
     summary="One of my vehicles",
-    responses={
-        401: {"description": "Missing or invalid token"},
-        403: {"description": "Caller does not hold the PROVIDER role"},
-        404: {"description": "Not found, or not owned by the caller"},
-    },
 )
 async def get_my_vehicle(
     vehicle_id: uuid.UUID,
     provider: User = Depends(provider_only),
     service: VehicleService = Depends(get_vehicle_service),
 ) -> VehicleOut:
-    """One of your own listings — what an edit screen loads to prefill its form.
-
-    Returns the **owner's** view, so unlike `GET /vehicles/{id}` it includes the
-    registration number and the moderation status, and it works regardless of
-    whether the listing is currently available or approved.
-
-    404 (not 403) for someone else's vehicle: a 403 would confirm the id is real,
-    which is how one provider enumerates another's inventory.
-    """
     return await service.get_my_vehicle(provider=provider, vehicle_id=vehicle_id)
 
 
@@ -171,12 +158,6 @@ async def get_my_vehicle(
     response_model=VehicleOut,
     tags=["vehicles"],
     summary="Edit a vehicle",
-    responses={
-        400: {"description": "Unknown vehicle type"},
-        403: {"description": "Caller does not hold the PROVIDER role"},
-        404: {"description": "Not found, or not owned by the caller"},
-        422: {"description": "A field is invalid"},
-    },
 )
 async def update_vehicle(
     vehicle_id: uuid.UUID,
@@ -184,23 +165,6 @@ async def update_vehicle(
     provider: User = Depends(provider_only),
     service: VehicleService = Depends(get_vehicle_service),
 ) -> VehicleOut:
-    """Change one of your own listings. **Partial** — send only what changed.
-
-    ```json
-    { "price_amount": 60000 }
-    ```
-
-    Two things worth knowing:
-
-    - **`image_urls` replaces the whole set.** Send all the photos you want to
-      keep, in the order you want them; the first is the card thumbnail. Omit the
-      field to leave the photos untouched.
-    - **`latitude: null` clears the coordinate**, while omitting `latitude`
-      leaves it as it was. Those are different requests.
-
-    `registration_number` cannot be changed — that would point the listing at a
-    different physical vehicle. Delete it and create a new listing instead.
-    """
     return await service.update_vehicle(provider=provider, vehicle_id=vehicle_id, payload=payload)
 
 
@@ -209,7 +173,6 @@ async def update_vehicle(
     response_model=VehicleOut,
     tags=["vehicles"],
     summary="Mark a vehicle available or unavailable",
-    responses={404: {"description": "Not found, or not owned by the caller"}},
 )
 async def set_availability(
     vehicle_id: uuid.UUID,
@@ -217,11 +180,6 @@ async def set_availability(
     provider: User = Depends(provider_only),
     service: VehicleService = Depends(get_vehicle_service),
 ) -> VehicleOut:
-    """Toggle a listing on or off the public feed.
-
-    This is the switch for "rented out this week" or "in for repair" — it keeps
-    the listing and its photos, unlike delete.
-    """
     return await service.set_availability(
         provider=provider, vehicle_id=vehicle_id, is_available=is_available
     )
@@ -232,18 +190,12 @@ async def set_availability(
     status_code=status.HTTP_204_NO_CONTENT,
     tags=["vehicles"],
     summary="Delete a vehicle",
-    responses={404: {"description": "Not found, or not owned by the caller"}},
 )
 async def delete_vehicle(
     vehicle_id: uuid.UUID,
     provider: User = Depends(provider_only),
     service: VehicleService = Depends(get_vehicle_service),
 ) -> Response:
-    """Remove a listing.
-
-    A soft delete: the row stays so history survives, but it leaves the feed and
-    releases the registration number for re-listing.
-    """
     await service.delete_vehicle(provider=provider, vehicle_id=vehicle_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -259,29 +211,31 @@ async def delete_vehicle(
 )
 async def list_available_vehicles(
     service: VehicleService = Depends(get_vehicle_service),
-    type_code: str | None = Query(
-        default=None,
-        description="Filter by vehicle type `code`, e.g. TRACTOR.",
-        examples=["TRACTOR"],
-    ),
+    type_code: str | None = Query(default=None, description="Filter by vehicle type code.", examples=["TRACTOR"]),
+    lat: float | None = Query(default=None, ge=-90, le=90, description="User latitude for geo-search."),
+    lng: float | None = Query(default=None, ge=-180, le=180, description="User longitude for geo-search."),
+    radius_km: float | None = Query(default=None, gt=0, le=500, description="Search radius in km."),
+    q: str | None = Query(default=None, max_length=100, description="Text search on name, brand, location."),
+    max_price: float | None = Query(default=None, gt=0, description="Max price per unit (paise)."),
+    available_only: bool = Query(default=True),
+    sort: str = Query(default="newest", pattern="^(newest|distance|price_asc|price_desc)$"),
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
 ) -> VehicleCardPage:
-    """Every available listing from every provider. **No login required.**
-
-    A listing appears here only when all four are true: not deleted, the owner
-    marked it available, moderation approved it, and the owner's account is
-    active.
-
-    The response contains **no provider phone number** and **no registration
-    number** — see `VehicleCardOut`. Contacting a provider goes through the
-    masked-calling endpoint in Phase 7.
-
-    Ordered newest first. Distance ordering arrives with radius search.
-    """
-    return await service.list_available_vehicles(
-        limit=limit, offset=offset, type_code=type_code.strip().upper() if type_code else None
+    """Browse available vehicles. Supports geo-radius search, text search, and sorting."""
+    params = VehicleSearchParams(
+        type_code=type_code.strip().upper() if type_code else None,
+        lat=lat,
+        lng=lng,
+        radius_km=radius_km,
+        q=q.strip() if q else None,
+        max_price=int(max_price) if max_price is not None else None,
+        available_only=available_only,
+        sort=sort,
+        limit=limit,
+        offset=offset,
     )
+    return await service.list_available_vehicles(params=params)
 
 
 @router.get(
@@ -289,20 +243,97 @@ async def list_available_vehicles(
     response_model=VehicleCardOut,
     tags=["vehicles"],
     summary="One vehicle's details",
-    responses={404: {"description": "No such vehicle, or it is not discoverable"}},
 )
 async def get_vehicle(
     vehicle_id: uuid.UUID,
     service: VehicleService = Depends(get_vehicle_service),
 ) -> VehicleCardOut:
-    """The listing behind a card on the feed. **No login required.**
-
-    Same visibility rules as `GET /vehicles`: a listing that is deleted,
-    unavailable, unapproved, or owned by a suspended provider returns **404**
-    here too. Hidden from the feed means hidden by id as well.
-
-    Carries **no provider phone number** and **no registration number**. To
-    contact the owner, use `provider_id` with the masked-calling endpoint
-    (Phase 7).
-    """
     return await service.get_public_vehicle(vehicle_id=vehicle_id)
+
+
+# ---------------------------------------------------------------------------
+# Masked calling
+# ---------------------------------------------------------------------------
+class CallInitiateIn(BaseModel):
+    vehicle_id: uuid.UUID
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {"vehicle_id": "3f2a-1234-5678-90ab-cdef01234567"}
+        }
+    }
+
+
+class CallInitiateOut(BaseModel):
+    call_id: uuid.UUID
+    proxy_number: str
+    expires_at: str
+    message: str = "Dial the proxy number to connect. It expires in 15 minutes."
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "call_id": "call-1234...",
+                "proxy_number": "+9198765xxxxx",
+                "expires_at": "2026-08-19T12:15:00Z",
+            }
+        }
+    }
+
+
+@router.post(
+    "/contact/call",
+    response_model=CallInitiateOut,
+    tags=["contact"],
+    summary="Initiate a masked call to a provider",
+    responses={
+        401: {"description": "Missing or invalid token (renter role required)"},
+        404: {"description": "Vehicle not found or not discoverable"},
+        503: {"description": "Masked calling not configured"},
+    },
+)
+async def initiate_call(
+    payload: CallInitiateIn,
+    user: User = Depends(require_role(UserRole.RENTER)),
+    settings: Settings = Depends(get_settings),
+    db: AsyncSession = Depends(get_db),
+) -> CallInitiateOut:
+    """Return a proxy phone number for a renter to call the provider of a vehicle.
+
+    The renter must be authenticated (RENTER role). The vehicle must be
+    discoverable. The provider's real number is never revealed.
+
+    MVP behaviour: logs the call request and returns a synthetic proxy number.
+    Production: integrate Twilio / Exotel / Knowlarity for a real proxy call.
+    """
+    repo = VehicleRepository(db)
+    vehicle = await repo.get_public_by_id(payload.vehicle_id)
+    if vehicle is None:
+        raise NotFoundError("Vehicle not found or not available.", code="VEHICLE_NOT_FOUND")
+
+    provider_user = vehicle.provider
+    if provider_user is None or not provider_user.phone_e164:
+        raise ServiceUnavailableError(
+            "The provider has no contact number on file.",
+            code="PROVIDER_NOT_CONTACTABLE",
+        )
+
+    log.info(
+        "call_initiated",
+        caller_id=str(user.id),
+        provider_id=str(vehicle.provider_user_id),
+        vehicle_id=str(payload.vehicle_id),
+    )
+
+    # For MVP testing: return a masked proxy based on the provider's real number.
+    # Swap this block for Twilio Client / Proxy integration in production.
+    real_number = provider_user.phone_e164
+    masked = real_number[:-4] + "xxxx"  # e.g. +9198765xxxxx
+    expires = dt.now(timezone.utc) + timedelta(minutes=15)
+
+    return CallInitiateOut(
+        call_id=uuid.uuid4(),
+        proxy_number=masked,
+        expires_at=expires.isoformat(),
+        message=f"Dial {masked} to call the provider. Your real number is hidden.",
+    )

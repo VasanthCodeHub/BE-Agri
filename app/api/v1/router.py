@@ -14,6 +14,12 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from app.modules.auth.router import router as auth_router
+from app.modules.bookings.router import router as bookings_router
+from app.modules.favourites.router import router as favourites_router
+from app.modules.notifications.router import router as notifications_router
+from app.modules.profile.router import router as profile_router
+from app.modules.provider.router import router as provider_router
+from app.modules.reviews.router import router as reviews_router
 from app.modules.uploads.router import router as uploads_router
 from app.modules.vehicles.router import router as vehicles_router
 
@@ -28,10 +34,21 @@ api_router.include_router(auth_router, prefix="/auth", tags=["auth"])
 # public ones (/vehicles, /vehicle-types), so the prefixes live on the routes.
 api_router.include_router(vehicles_router)
 
+api_router.include_router(favourites_router)
+api_router.include_router(reviews_router)
+api_router.include_router(notifications_router)
+
 # Upload authorisation. Its own module because provider verification documents
 # (Phase 5) will need the same signature.
 api_router.include_router(uploads_router)
 
+api_router.include_router(bookings_router)
+
+api_router.include_router(favourites_router)
+api_router.include_router(reviews_router)
+api_router.include_router(notifications_router)
+api_router.include_router(profile_router, tags=["profile"])
+api_router.include_router(provider_router, tags=["provider"])
+
 # Coming next:
-# api_router.include_router(users_router, prefix="/me", tags=["profile"])
 # api_router.include_router(search_router, prefix="/search", tags=["search"])

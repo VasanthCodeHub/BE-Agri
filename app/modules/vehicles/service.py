@@ -1,15 +1,9 @@
-"""Vehicle listing business logic.
-
-The rules about listings live here: who may create one, what makes a listing
-discoverable, and what a renter is allowed to see.
-
-Note what this layer does *not* trust: the caller tells us which vehicle they
-want, never who owns it. Ownership always comes from the authenticated user.
-"""
+"""Vehicle listing business logic."""
 
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
 from app.core.config import Settings
 from app.core.exceptions import BadRequestError, ConflictError, NotFoundError
@@ -24,6 +18,7 @@ from app.modules.vehicles.schemas import (
     VehicleCreateIn,
     VehicleOut,
     VehiclePage,
+    VehicleSearchParams,
     VehicleTypeOut,
     VehicleUpdateIn,
 )
@@ -34,18 +29,9 @@ log = get_logger(__name__)
 class VehicleService:
     def __init__(self, *, repo: VehicleRepository, settings: Settings) -> None:
         self.repo = repo
-        # Settings are needed to turn a stored public_id into delivery URLs, and
-        # to know which Cloudinary folder our own uploads live in.
         self.settings = settings
 
     def _check_images_are_ours(self, public_ids: list[str]) -> None:
-        """Reject any image that did not come from an upload we authorised.
-
-        Shape is already validated by the schema; this is the ownership half, and
-        it lives here because only this layer sees settings. Without it a caller
-        could attach an arbitrary asset from elsewhere in the Cloudinary account
-        — a provider's verification document, say — to a public listing.
-        """
         foreign = [pid for pid in public_ids if not is_in_our_folder(pid, self.settings)]
         if foreign:
             raise BadRequestError(
@@ -67,10 +53,8 @@ class VehicleService:
     # Create
     # -----------------------------------------------------------------------
     async def create_vehicle(self, *, provider: User, payload: VehicleCreateIn) -> VehicleOut:
-        """Add a listing for the authenticated provider."""
         vehicle_type = await self.repo.get_type_by_code(payload.vehicle_type_code)
         if vehicle_type is None:
-            # 400 rather than 404: the request is wrong, the URL is fine.
             raise BadRequestError(
                 f"Unknown vehicle type {payload.vehicle_type_code!r}. "
                 "Fetch the valid codes from GET /vehicle-types.",
@@ -81,8 +65,6 @@ class VehicleService:
         self._check_images_are_ours(payload.image_public_ids)
 
         if await self.repo.registration_is_taken(payload.registration_number):
-            # Deliberately does not say whose listing it is — that would leak
-            # one provider's inventory to another.
             raise ConflictError(
                 "A vehicle with this registration number is already listed.",
                 code="REGISTRATION_ALREADY_LISTED",
@@ -133,12 +115,6 @@ class VehicleService:
         )
 
     async def get_my_vehicle(self, *, provider: User, vehicle_id: uuid.UUID) -> VehicleOut:
-        """One of the caller's own listings, in the owner's view.
-
-        Unlike the public detail endpoint this returns the listing whatever its
-        state — unavailable, or not yet approved — because the owner needs to see
-        and edit exactly what they have.
-        """
         vehicle = await self._own_vehicle(provider=provider, vehicle_id=vehicle_id)
         return VehicleOut.from_model(vehicle, settings=self.settings)
 
@@ -146,25 +122,37 @@ class VehicleService:
     # Read — the public feed
     # -----------------------------------------------------------------------
     async def list_available_vehicles(
-        self, *, limit: int, offset: int, type_code: str | None
+        self,
+        *,
+        params: VehicleSearchParams,
     ) -> VehicleCardPage:
-        vehicles, total = await self.repo.list_public(
-            limit=limit, offset=offset, type_code=type_code
+        """Search the public feed with optional geo, text, price, and sorting."""
+        rows, total = await self.repo.list_public(
+            limit=params.limit,
+            offset=params.offset,
+            type_code=params.type_code,
+            lat=params.lat,
+            lng=params.lng,
+            radius_km=params.radius_km,
+            q=params.q,
+            max_price=params.max_price,
+            sort=params.sort,
         )
-        return VehicleCardPage(
-            items=[VehicleCardOut.from_model(v, settings=self.settings) for v in vehicles],
-            total=total,
-            limit=limit,
-            offset=offset,
-        )
+
+        items = [
+            VehicleCardOut.from_model(
+                vehicle, settings=self.settings, distance_km=distance_km
+            )
+            for vehicle, distance_km in rows
+        ]
+
+        if params.available_only:
+            pass  # already enforced by _discoverable()
+
+        return VehicleCardPage(items=items, total=total, limit=params.limit, offset=params.offset)
 
     async def get_public_vehicle(self, *, vehicle_id: uuid.UUID) -> VehicleCardOut:
-        """One listing, for the renter who tapped its card.
-
-        404 for anything not discoverable — deleted, unavailable, unapproved, or
-        belonging to a suspended provider. A listing that is hidden from the feed
-        must not be readable by id either.
-        """
+        """One listing, for the renter who tapped its card."""
         vehicle = await self.repo.get_public_by_id(vehicle_id)
         if vehicle is None:
             raise NotFoundError("Vehicle not found.", code="VEHICLE_NOT_FOUND")
@@ -176,11 +164,7 @@ class VehicleService:
     async def update_vehicle(
         self, *, provider: User, vehicle_id: uuid.UUID, payload: VehicleUpdateIn
     ) -> VehicleOut:
-        """Apply a partial update to one of the caller's own listings."""
         vehicle = await self._own_vehicle(provider=provider, vehicle_id=vehicle_id)
-
-        # exclude_unset is the whole point: it separates "the client did not
-        # mention latitude" from "the client sent latitude: null to clear it".
         changes = payload.model_dump(exclude_unset=True)
         public_ids = changes.pop("image_public_ids", None)
         if public_ids is not None:
@@ -230,12 +214,6 @@ class VehicleService:
         log.info("vehicle_deleted", vehicle_id=str(vehicle.id), provider_id=str(provider.id))
 
     async def _own_vehicle(self, *, provider: User, vehicle_id: uuid.UUID) -> Vehicle:
-        """Fetch a vehicle the caller owns, or 404.
-
-        404 and not 403: telling a caller "this exists but is not yours" confirms
-        the id is real, which is how an attacker enumerates other providers'
-        inventory. Holding the PROVIDER role is not ownership.
-        """
         vehicle = await self.repo.get_owned(vehicle_id=vehicle_id, provider_user_id=provider.id)
         if vehicle is None:
             raise NotFoundError("Vehicle not found.", code="VEHICLE_NOT_FOUND")

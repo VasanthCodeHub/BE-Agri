@@ -1,0 +1,1 @@
+"""Booking requests — vehicle reservations."""
