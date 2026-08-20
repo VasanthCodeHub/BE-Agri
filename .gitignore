@@ -41,3 +41,4 @@ media/
 RE
 # Logs
 *.log
+lambda-build/

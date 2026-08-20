@@ -1,0 +1,31 @@
+﻿# Direct dependencies of BE-Agri. Transitive deps are resolved by pip automatically.
+# This list mirrors [project].dependencies in pyproject.toml (the source of truth).
+
+# --- Web framework ----------------------------------------------------
+fastapi>=0.115
+uvicorn[standard]>=0.32
+python-multipart>=0.0.12
+mangum>=0.19
+
+# --- Validation & configuration ---------------------------------------
+pydantic>=2.9
+pydantic-settings>=2.6
+
+# --- Database ----------------------------------------------------------
+sqlalchemy[asyncio]>=2.0.36
+asyncpg>=0.30
+alembic>=1.14
+geoalchemy2>=0.15
+
+# --- Security ----------------------------------------------------------
+pyjwt>=2.10
+argon2-cffi>=23.1
+
+# --- Observability -----------------------------------------------------
+structlog>=24.4
+
+# --- Outbound HTTP (SMS / Cloudinary) ---------------------------------
+httpx>=0.27
+
+# --- Platform ----------------------------------------------------------
+tzdata>=2024.2

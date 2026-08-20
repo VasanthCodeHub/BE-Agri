@@ -13,6 +13,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+from mangum import Mangum
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -234,3 +235,4 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
 #: The ASGI application uvicorn imports.
 app = create_app()
+handler = Mangum(app)

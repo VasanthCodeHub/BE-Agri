@@ -9,6 +9,7 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",       # ASGI server that actually listens on a port
     "python-multipart>=0.0.12",      # needed later for form/file uploads
+    "mangum>=0.19",
 
     # --- Validation & configuration ---------------------------------------
     "pydantic>=2.9",
