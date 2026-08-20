@@ -139,9 +139,16 @@ class VehicleService:
             sort=params.sort,
         )
 
+        stats = await self.repo.review_stats(
+            [vehicle.id for vehicle, _distance in rows]
+        )
         items = [
             VehicleCardOut.from_model(
-                vehicle, settings=self.settings, distance_km=distance_km
+                vehicle,
+                settings=self.settings,
+                distance_km=distance_km,
+                rating=stats.get(vehicle.id, (None, 0))[0],
+                review_count=stats.get(vehicle.id, (None, 0))[1],
             )
             for vehicle, distance_km in rows
         ]
@@ -156,7 +163,14 @@ class VehicleService:
         vehicle = await self.repo.get_public_by_id(vehicle_id)
         if vehicle is None:
             raise NotFoundError("Vehicle not found.", code="VEHICLE_NOT_FOUND")
-        return VehicleCardOut.from_model(vehicle, settings=self.settings)
+        stats = await self.repo.review_stats([vehicle.id])
+        rating, review_count = stats.get(vehicle.id, (None, 0))
+        return VehicleCardOut.from_model(
+            vehicle,
+            settings=self.settings,
+            rating=rating,
+            review_count=review_count,
+        )
 
     # -----------------------------------------------------------------------
     # Update

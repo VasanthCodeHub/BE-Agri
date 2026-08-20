@@ -34,10 +34,6 @@ api_router.include_router(auth_router, prefix="/auth", tags=["auth"])
 # public ones (/vehicles, /vehicle-types), so the prefixes live on the routes.
 api_router.include_router(vehicles_router)
 
-api_router.include_router(favourites_router)
-api_router.include_router(reviews_router)
-api_router.include_router(notifications_router)
-
 # Upload authorisation. Its own module because provider verification documents
 # (Phase 5) will need the same signature.
 api_router.include_router(uploads_router)

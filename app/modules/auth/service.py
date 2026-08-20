@@ -126,6 +126,10 @@ class AuthService:
         code: str,
         name: str | None,
         user_agent: str | None,
+        email: str | None = None,
+        address: str | None = None,
+        latitude: float | None = None,
+        longitude: float | None = None,
     ) -> LoginOut:
         otp = await self.repo.get_active_otp(phone_e164)
         if otp is None:
@@ -187,7 +191,15 @@ class AuthService:
                     "Please provide your name to complete registration.",
                     code="NAME_REQUIRED",
                 )
-            user = await self.repo.create_user(phone_e164=phone_e164, full_name=name, role=role)
+            user = await self.repo.create_user(
+                phone_e164=phone_e164,
+                full_name=name,
+                role=role,
+                email=email,
+                address=address,
+                latitude=latitude,
+                longitude=longitude,
+            )
             log.info("user_registered", user_id=str(user.id), role=role.value)
         else:
             if not user.is_active:
@@ -204,6 +216,13 @@ class AuthService:
                 log.info("role_granted", user_id=str(user.id), role=role.value)
             if name and not user.full_name:
                 await self.repo.set_name(user, name)
+            await self.repo.update_profile(
+                user,
+                email=email,
+                address=address,
+                latitude=latitude,
+                longitude=longitude,
+            )
             await self.repo.touch_login(user)
 
         tokens = await self._issue_session(user=user, role=role, user_agent=user_agent)

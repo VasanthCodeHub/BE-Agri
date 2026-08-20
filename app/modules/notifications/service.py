@@ -48,6 +48,29 @@ class NotificationService:
         log.info("notifications_mark_all_read", user_id=str(user.id), count=count)
         return count
 
+    async def notify(
+        self,
+        user_id,
+        *,
+        type: NotificationType,
+        title: str,
+        body: str,
+        data: dict | None = None,
+    ) -> Notification:
+        """Create a notification for one user. Used by other modules.
+
+        Safe to call from anywhere in a request: the surrounding transaction
+        commits (or rolls back) the notification along with the change that
+        triggered it.
+        """
+        return await self._notify(
+            user_id,
+            type=type,
+            title=title,
+            body=body,
+            data=data,
+        )
+
     async def _notify(
         self,
         user_id,

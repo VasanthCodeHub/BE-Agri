@@ -31,6 +31,8 @@ from app.modules.bookings.schemas import (
     BookingUpdateIn,
 )
 from app.modules.bookings.service import BookingService
+from app.modules.notifications.repository import NotificationRepository
+from app.modules.notifications.service import NotificationService
 
 log = get_logger(__name__)
 router = APIRouter()
@@ -44,6 +46,7 @@ def get_booking_service(
         repo=BookingRepository(db),
         repo_vehicles=VehicleRepository(db),
         settings=settings,
+        notifier=NotificationService(repo=NotificationRepository(db)),
     )
 
 

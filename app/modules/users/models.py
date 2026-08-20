@@ -13,7 +13,7 @@ import uuid
 from datetime import datetime
 from enum import StrEnum
 
-from sqlalchemy import DateTime, Enum, ForeignKey, String, UniqueConstraint, func
+from sqlalchemy import DateTime, Enum, Float, ForeignKey, String, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -53,6 +53,14 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     #: Captured at first OTP verification. Nullable because a user exists the
     #: moment their phone is verified, which is before any profile work.
     full_name: Mapped[str | None] = mapped_column(String(120))
+
+    #: Registration/profile details the app collects but which are not the
+    #: identity — the phone number is. All nullable: a user exists after OTP
+    #: verification alone.
+    email: Mapped[str | None] = mapped_column(String(254))
+    address: Mapped[str | None] = mapped_column(String(255))
+    latitude: Mapped[float | None] = mapped_column(Float)
+    longitude: Mapped[float | None] = mapped_column(Float)
 
     status: Mapped[UserStatus] = mapped_column(
         user_status_enum, default=UserStatus.ACTIVE, server_default=UserStatus.ACTIVE.value

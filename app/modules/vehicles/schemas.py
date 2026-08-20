@@ -149,7 +149,16 @@ class VehicleCreateIn(BaseModel):
         examples=["Sulur, Coimbatore"],
     )
     fuel_type: FuelType = Field(..., examples=["DIESEL"])
-    power_hp: int = Field(..., ge=1, le=2000, description="Engine power in HP.", examples=[47])
+    power_hp: int = Field(
+        ...,
+        ge=0,
+        le=2000,
+        description=(
+            "Engine power in HP. 0 is valid for non-motorised implements "
+            "(rotavators, trailers, ploughs)."
+        ),
+        examples=[47],
+    )
     transmission: Transmission = Field(..., examples=["MANUAL"])
     image_public_ids: list[str] = Field(
         default_factory=list,
@@ -218,7 +227,7 @@ class VehicleUpdateIn(BaseModel):
     latitude: float | None = Field(default=None, ge=-90, le=90)
     longitude: float | None = Field(default=None, ge=-180, le=180)
     fuel_type: FuelType | None = None
-    power_hp: int | None = Field(default=None, ge=1, le=2000)
+    power_hp: int | None = Field(default=None, ge=0, le=2000)
     transmission: Transmission | None = None
     is_available: bool | None = None
     image_public_ids: list[str] | None = Field(
@@ -359,7 +368,6 @@ class VehicleCardOut(BaseModel):
     images: list[VehicleImageOut]
     provider_id: uuid.UUID = Field(description="Use this to initiate a call.")
     provider_name: str | None
-    provider_phone: str | None = Field(default=None, description="Revealed after /contact/call.")
     rating: float | None = Field(default=None, ge=0, le=5)
     review_count: int = Field(default=0, ge=0)
     distance_km: float | None = Field(default=None, ge=0)
@@ -390,7 +398,6 @@ class VehicleCardOut(BaseModel):
                 ],
                 "provider_id": "abc...",
                 "provider_name": "Ravi Kumar",
-                "provider_phone": "+9198765xxxxx",
                 "rating": 4.2,
                 "review_count": 3,
                 "distance_km": 12.5,
@@ -405,6 +412,8 @@ class VehicleCardOut(BaseModel):
         *,
         settings: Settings,
         distance_km: float | None = None,
+        rating: float | None = None,
+        review_count: int = 0,
     ) -> VehicleCardOut:
         return cls(
             id=vehicle.id,
@@ -426,9 +435,8 @@ class VehicleCardOut(BaseModel):
             ],
             provider_id=vehicle.provider_user_id,
             provider_name=vehicle.provider.full_name if vehicle.provider else None,
-            provider_phone=vehicle.provider.phone_e164 if vehicle.provider else None,
-            rating=None,
-            review_count=0,
+            rating=rating,
+            review_count=review_count,
             distance_km=distance_km,
         )
 

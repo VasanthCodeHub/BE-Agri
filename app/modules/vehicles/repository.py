@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.security import utc_now
+from app.modules.reviews.models import Review
 from app.modules.users.models import User, UserStatus
 from app.modules.vehicles.models import (
     ListingStatus,
@@ -17,6 +18,7 @@ from app.modules.vehicles.models import (
     VehicleImage,
     VehicleType,
 )
+from app.modules.vehicles.registration import normalise_registration_number
 
 
 class VehicleRepository:
@@ -42,9 +44,12 @@ class VehicleRepository:
     # Writes
     # -----------------------------------------------------------------------
     async def registration_is_taken(self, registration_number: str) -> bool:
+        # Normalise here, not just in the schema: the unique index compares the
+        # canonical form, so "TN 38 AB 1234" and "TN38AB1234" must both hit it.
+        normalised = normalise_registration_number(registration_number)
         result = await self.db.execute(
             select(Vehicle.id).where(
-                Vehicle.registration_number == registration_number,
+                Vehicle.registration_number == normalised,
                 Vehicle.deleted_at.is_(None),
             )
         )
@@ -121,6 +126,30 @@ class VehicleRepository:
             self._discoverable().where(Vehicle.id == vehicle_id)
         )
         return result.scalars().unique().one_or_none()
+
+    async def review_stats(
+        self, vehicle_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, tuple[float, int]]:
+        """Average rating and review count per vehicle, one query.
+
+        Returns {vehicle_id: (avg_rating, count)}. Vehicles with no reviews
+        are simply absent from the dict — callers default to (None, 0).
+        """
+        if not vehicle_ids:
+            return {}
+        rows = await self.db.execute(
+            select(
+                Review.vehicle_id,
+                func.avg(Review.rating),
+                func.count(Review.id),
+            )
+            .where(Review.vehicle_id.in_(vehicle_ids))
+            .group_by(Review.vehicle_id)
+        )
+        return {
+            vehicle_id: (round(float(avg), 2), int(count))
+            for vehicle_id, avg, count in rows.all()
+        }
 
     async def list_public(
         self,
@@ -215,12 +244,14 @@ class VehicleRepository:
             dist_expr = None
 
         # Build column list
+        select_cols: list[Any]
         if dist_expr is not None:
             select_cols = [Vehicle, dist_expr.label("distance_km")]
         else:
             select_cols = [Vehicle]
 
-        stmt = select(*select_cols).select_from(base)
+        # Use base.with_only_columns to preserve joins, not select_from(base)
+        stmt = base.with_only_columns(*select_cols).order_by(None)  # type: ignore[arg-type]
 
         if sort == "distance" and dist_expr is not None:
             stmt = stmt.order_by(text("distance_km NULLS LAST"), Vehicle.created_at.desc())

@@ -147,7 +147,7 @@ class Vehicle(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             name="manufacture_year_plausible",
         ),
         CheckConstraint("price_amount > 0", name="price_amount_positive"),
-        CheckConstraint("power_hp BETWEEN 1 AND 2000", name="power_hp_plausible"),
+        CheckConstraint("power_hp BETWEEN 0 AND 2000", name="power_hp_plausible"),
         CheckConstraint(
             "latitude IS NULL OR latitude BETWEEN -90 AND 90",
             name="latitude_in_range",

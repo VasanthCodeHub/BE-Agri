@@ -10,12 +10,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings, get_settings
 from app.core.logging import get_logger
 from app.db.session import get_db
-from app.modules.auth.dependencies import require_role
+from app.modules.auth.dependencies import get_current_user
 from app.modules.notifications.models import Notification
 from app.modules.notifications.repository import NotificationRepository
 from app.modules.notifications.schemas import NotificationOut, NotificationPage
 from app.modules.notifications.service import NotificationService
-from app.modules.users.models import User, UserRole
+from app.modules.users.models import User
 
 log = get_logger(__name__)
 router = APIRouter()
@@ -36,7 +36,7 @@ def get_notification_service(
     operation_id="notifications_list_mine",
 )
 async def list_notifications(
-    user: User = Depends(require_role(UserRole.RENTER)),
+    user: User = Depends(get_current_user),
     service: NotificationService = Depends(get_notification_service),
     is_read: bool | None = Query(default=None),
     limit: int = Query(default=20, ge=1, le=100),
@@ -56,7 +56,7 @@ async def list_notifications(
 )
 async def mark_read(
     notification_id: uuid.UUID,
-    user: User = Depends(require_role(UserRole.RENTER)),
+    user: User = Depends(get_current_user),
     service: NotificationService = Depends(get_notification_service),
 ) -> NotificationOut:
     await service.mark_read(user=user, notification_id=notification_id)
@@ -75,7 +75,7 @@ async def mark_read(
     operation_id="notifications_mark_all_read",
 )
 async def mark_all_read(
-    user: User = Depends(require_role(UserRole.RENTER)),
+    user: User = Depends(get_current_user),
     service: NotificationService = Depends(get_notification_service),
 ) -> dict:
     count = await service.mark_all_read(user=user)

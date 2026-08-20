@@ -56,7 +56,17 @@ class AuthRepository:
         result = await self.db.execute(select(User).where(User.id == user_id))
         return result.scalar_one_or_none()
 
-    async def create_user(self, *, phone_e164: str, full_name: str | None, role: UserRole) -> User:
+    async def create_user(
+        self,
+        *,
+        phone_e164: str,
+        full_name: str | None,
+        role: UserRole,
+        email: str | None = None,
+        address: str | None = None,
+        latitude: float | None = None,
+        longitude: float | None = None,
+    ) -> User:
         """Create a user with their first role.
 
         Called only after the OTP has been verified, so every row in `users`
@@ -65,6 +75,10 @@ class AuthRepository:
         user = User(
             phone_e164=phone_e164,
             full_name=full_name,
+            email=email,
+            address=address,
+            latitude=latitude,
+            longitude=longitude,
             phone_verified_at=utc_now(),
             last_login_at=utc_now(),
         )
@@ -97,6 +111,34 @@ class AuthRepository:
     async def set_name(self, user: User, full_name: str) -> None:
         user.full_name = full_name
         await self.db.flush()
+
+    async def update_profile(
+        self,
+        user: User,
+        *,
+        full_name: str | None = None,
+        email: str | None = None,
+        address: str | None = None,
+        latitude: float | None = None,
+        longitude: float | None = None,
+    ) -> User:
+        """Persist whichever profile fields were supplied.
+
+        `None` means "leave unchanged"; to clear a field the caller passes an
+        explicit empty string (which the profile schema maps to null).
+        """
+        if full_name is not None:
+            user.full_name = full_name or None
+        if email is not None:
+            user.email = email or None
+        if address is not None:
+            user.address = address or None
+        if latitude is not None:
+            user.latitude = latitude
+        if longitude is not None:
+            user.longitude = longitude
+        await self.db.flush()
+        return user
 
     # -----------------------------------------------------------------------
     # OTP requests

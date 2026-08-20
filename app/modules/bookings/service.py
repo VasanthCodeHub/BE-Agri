@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 import uuid
 from datetime import date, datetime as dt, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from app.core.config import Settings
 from app.core.exceptions import (
@@ -18,7 +18,6 @@ from app.core.logging import get_logger
 from app.modules.bookings.models import (
     BookingStatus,
     SessionBlock,
-    _SESSION_DEFAULTS,
 )
 from app.modules.bookings.repository import BookingRepository
 from app.modules.bookings.schemas import (
@@ -28,11 +27,32 @@ from app.modules.bookings.schemas import (
     BookingPage,
     BookingUpdateIn,
 )
-from app.modules.vehicles.models import ListingStatus, Vehicle
+from app.modules.notifications.models import NotificationType
+from app.modules.vehicles.models import ListingStatus, PriceUnit, Vehicle
 from app.modules.vehicles.repository import VehicleRepository
 
 if TYPE_CHECKING:
     from app.modules.users.models import User
+
+
+class Notifier(Protocol):
+    """Anything that can create a notification.
+
+    A Protocol keeps BookingService decoupled from the notifications module:
+    tests can pass a stub, and the production wiring passes a
+    NotificationService that shares this request's database session.
+    """
+
+    async def notify(
+        self,
+        user_id: uuid.UUID,
+        *,
+        type: NotificationType,
+        title: str,
+        body: str,
+        data: dict | None = None,
+    ) -> object:
+        ...
 
 log = get_logger(__name__)
 
@@ -46,6 +66,55 @@ _ALLOWED_TRANSITIONS: dict[BookingStatus, set[BookingStatus]] = {
     BookingStatus.CANCELLED: set(),
 }
 
+#: A "day" of rental is 8 working hours — the FULL_DAY session. Shorter
+#: sessions are billed as a fraction of that day.
+_DAY_WORKING_HOURS = 8
+
+
+def _status_notification_type(status: BookingStatus) -> NotificationType:
+    return {
+        BookingStatus.ACCEPTED: NotificationType.BOOKING_ACCEPTED,
+        BookingStatus.REJECTED: NotificationType.BOOKING_REJECTED,
+        BookingStatus.ACTIVE: NotificationType.BOOKING_ACCEPTED,
+        BookingStatus.COMPLETED: NotificationType.BOOKING_ACCEPTED,
+    }.get(status, NotificationType.BOOKING_ACCEPTED)
+
+
+def _status_notification_text(
+    old_status: BookingStatus, new_status: BookingStatus, reference: str
+) -> tuple[str | None, str]:
+    """(title, body) for a booking status change, or (None, ...) to skip."""
+    if new_status is BookingStatus.ACCEPTED:
+        return f"Booking {reference} accepted", "The provider accepted your booking."
+    if new_status is BookingStatus.REJECTED:
+        return f"Booking {reference} rejected", "The provider could not accept your booking."
+    if new_status is BookingStatus.ACTIVE:
+        return f"Booking {reference} started", "Your rental is now active."
+    if new_status is BookingStatus.COMPLETED:
+        return f"Booking {reference} completed", "Your rental is complete. Rate the vehicle."
+    return (None, "")
+
+
+def _compute_amount(
+    *, price_amount: int, price_unit: PriceUnit, duration_hours: int
+) -> int:
+    """The booking charge, derived from the vehicle's price unit.
+
+    The old formula divided by the session's own default duration, so
+    `price × 4h / 4h` always cancelled back to the bare price — every
+    session cost the same regardless of length. Now:
+
+    - **HOUR** vehicles charge per hour: 4h costs 4× the hourly rate.
+    - **DAY** vehicles charge a fraction of the daily rate.
+    - **ACRE / TRIP** are per unit of work, not per hour, so the session is a
+      single charge at the advertised rate.
+    """
+    if price_unit is PriceUnit.HOUR:
+        return price_amount * duration_hours
+    if price_unit is PriceUnit.DAY:
+        return int(round(price_amount * duration_hours / _DAY_WORKING_HOURS))
+    return price_amount
+
 
 class BookingService:
     def __init__(
@@ -54,10 +123,12 @@ class BookingService:
         repo: BookingRepository,
         repo_vehicles: VehicleRepository,
         settings: Settings,
+        notifier: Notifier | None = None,
     ) -> None:
         self.repo = repo
         self.repo_vehicles = repo_vehicles
         self.settings = settings
+        self.notifier = notifier
 
     # -----------------------------------------------------------------------
     # Availability
@@ -124,9 +195,11 @@ class BookingService:
         # Reference: AGR-XXXXX (5 random digits)
         reference = self._generate_reference()
 
-        # Amount: price_per_session = price_amount × duration / default_duration
-        default_dur = _SESSION_DEFAULTS.get(payload.session, 4)
-        amount_paise = int(round(vehicle.price_amount * payload.duration_hours / default_dur))
+        amount_paise = _compute_amount(
+            price_amount=vehicle.price_amount,
+            price_unit=vehicle.price_unit,
+            duration_hours=payload.duration_hours,
+        )
 
         booking = Booking(
             vehicle_id=payload.vehicle_id,
@@ -148,6 +221,20 @@ class BookingService:
             renter_id=str(renter.id),
             reference=reference,
         )
+
+        if self.notifier is not None:
+            await self.notifier.notify(
+                vehicle.provider_user_id,
+                type=NotificationType.BOOKING_REQUEST,
+                title="New booking request",
+                body=f"{renter.full_name or 'A renter'} wants to book "
+                f"{vehicle.name} for {payload.booking_date} ({payload.session.value}).",
+                data={
+                    "booking_id": str(booking.id),
+                    "vehicle_id": str(vehicle.id),
+                    "reference": reference,
+                },
+            )
         return BookingOut.from_model(booking)
 
     # -----------------------------------------------------------------------
@@ -223,6 +310,19 @@ class BookingService:
             old=old_status.value,
             new=new_status.value,
         )
+
+        if self.notifier is not None:
+            title, body = _status_notification_text(
+                old_status, new_status, booking.reference
+            )
+            if title:
+                await self.notifier.notify(
+                    booking.renter_user_id,
+                    type=_status_notification_type(new_status),
+                    title=title,
+                    body=body,
+                    data={"booking_id": str(booking.id), "reference": booking.reference},
+                )
         return BookingOut.from_model(booking)
 
     # -----------------------------------------------------------------------
@@ -242,6 +342,15 @@ class BookingService:
             )
         await self.repo.cancel(booking=booking)
         log.info("booking_cancelled", booking_id=str(booking.id))
+
+        if self.notifier is not None:
+            await self.notifier.notify(
+                booking.provider_user_id,
+                type=NotificationType.BOOKING_CANCELLED,
+                title="Booking cancelled",
+                body=f"Booking {booking.reference} was cancelled by the renter.",
+                data={"booking_id": str(booking.id), "reference": booking.reference},
+            )
 
     async def _own_renter_booking(
         self, *, renter: "User", booking_id: uuid.UUID

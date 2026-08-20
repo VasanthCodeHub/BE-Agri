@@ -102,6 +102,10 @@ async def verify_otp(
         code=payload.code,
         name=payload.name,
         user_agent=user_agent,
+        email=payload.email,
+        address=payload.address,
+        latitude=payload.latitude,
+        longitude=payload.longitude,
     )
 
 

@@ -96,6 +96,20 @@ class OtpVerifyIn(BaseModel):
         description="Required only for a new user (when name_required was true).",
         examples=["Vasanth"],
     )
+    email: str | None = Field(
+        default=None,
+        max_length=254,
+        description="Optional, collected at registration.",
+        examples=["vasanth@example.com"],
+    )
+    address: str | None = Field(
+        default=None,
+        max_length=255,
+        description="Optional, collected at registration.",
+        examples=["12 Gandhi Street, Sulur, Coimbatore"],
+    )
+    latitude: float | None = Field(default=None, ge=-90, le=90, examples=[11.0246])
+    longitude: float | None = Field(default=None, ge=-180, le=180, examples=[77.1252])
 
     @field_validator("phone")
     @classmethod
