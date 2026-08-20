@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from enum import StrEnum
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, JSON, String, func
+from sqlalchemy import JSON, Boolean, DateTime, Enum, ForeignKey, Index, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -14,10 +14,13 @@ from app.modules.users.models import User
 
 
 class NotificationType(StrEnum):
-    BOOKING_REQUEST = "BOOKING_REQUEST"
-    BOOKING_ACCEPTED = "BOOKING_ACCEPTED"
-    BOOKING_REJECTED = "BOOKING_REJECTED"
-    BOOKING_CANCELLED = "BOOKING_CANCELLED"
+    """The kinds of notification a user can receive.
+
+    The product has no bookings, so there are no booking notifications. The
+    database enum still carries the retired BOOKING_* values until every
+    environment has upgraded — the Python enum never inserts them.
+    """
+
     CALL_INITIATED = "CALL_INITIATED"
     NEW_REVIEW = "NEW_REVIEW"
 

@@ -1,10 +1,13 @@
 # AgriAPP — what the mobile app needs from the API
 
-Checked against the live spec on 17 Aug 2026 (`openapi.json`, 15 paths, v0.1.0)
-and by calling the running server.
+Checked against the live server on 21 Aug 2026 after the backend rework
+(bookings removed; contact/call, vehicle master data, profile, notifications,
+reviews and favourites added).
 
-The renter catalogue and provider vehicle management are wired to the real API
-and working. Everything listed here is either blocked, faked, or degraded.
+The catalogue, provider vehicle management, contact, master data, profile,
+favourites, notifications, reviews and the provider dashboard are wired to the
+real API and working. Everything listed here is either blocked, faked, or
+degraded.
 
 ## Start here
 
@@ -13,20 +16,16 @@ the app dead.
 
 | | What | Why it matters |
 |---|---|---|
-| **P0** | Uploads are off + a listing requires an image | Nothing can be created, so the catalogue is empty and the app shows blank screens |
-| **P1** | Radius search params | The core premise of the product; not possible today |
-| **P1** | Masked calling | Explicitly in the brief; no endpoint at all |
-| **P1** | Missing vehicle fields | UI renders zeros for ratings and distance |
-| **P2** | Bookings | 6 built screens on mock data — but see the scope question |
-| **P3** | Favourites, notifications, reviews, profile editing | Whole features faked |
+| **P0** | Cloudinary credentials + signed upload preset not configured | `POST /provider/uploads/signature` returns `503 UPLOADS_NOT_CONFIGURED`, so nothing can be created and the catalogue stays empty |
+| **P1** | Radius search on the feed | The core premise of the product; params exist but the app does not send them |
+| **P1** | `completed_rentals` on the card | Cannot exist — the product has no bookings, so there is no rental history to count. Remove the UI field or display nothing |
+| **P2** | Vehicle master data seeded in the target DB | The dropdown cascade (manufacturer → model → variant) is empty until `seed_master_data.py` is run against the real database |
 
 ---
 
 ## P0 — the app cannot create anything
 
-Two separate things that combine into a deadlock.
-
-**1. Image uploads are switched off.**
+Image uploads are switched off on this server (Cloudinary is not configured):
 
 ```
 POST /api/v1/provider/uploads/signature  →  503
@@ -34,103 +33,73 @@ POST /api/v1/provider/uploads/signature  →  503
           "message":"Image uploads are not available on this server yet."}}
 ```
 
-**2. A listing cannot be created without at least one image.**
+And a listing cannot be created without at least one image
+(`image_public_ids` requires 1–6 items). So until Cloudinary is configured, no
+vehicle can be created by anyone and the feed is empty.
 
-```
-POST /api/v1/provider/vehicles   with  "image_public_ids": []   →  422
-{"field":"image_public_ids",
- "reason":"List should have at least 1 item after validation, not 0"}
-```
-
-Uploads are off, and creating a listing requires an uploaded image. So **no
-vehicle can be created by anyone**, which is why `GET /vehicles` returns
-`{"items":[],"total":0}` and the app has nothing to display.
-
-Any one of these unblocks us:
-
-- Configure Cloudinary — the proper fix
-- Allow `image_public_ids` to be empty, so listings can be created now and
-  photographed later
-- Seed 5–10 listings server-side, so at least the renter side can be demoed
+Fix: configure `CLOUDINARY_*` in `.env` and create the signed upload preset
+(see `docs/SETUP.md` §2.6). Nothing else blocks creation.
 
 ---
 
 ## P1 — needed for the MVP as scoped
 
-### Search parameters
+### Radius search on the feed
 
-`GET /vehicles` accepts only `type_code`, `limit`, `offset`. Everything else is
-filtered client-side over a single 100-row page, which breaks as soon as the
-catalogue outgrows one page.
+`GET /vehicles` supports `lat` + `lng` + `radius_km` and `sort=distance` — the
+backend does the ST_DWithin search and returns `distance_km` per item. The app
+does not send the device's coordinates yet, so every feed request today is
+unfiltered and `distance_km` is null.
 
-Needed: `lat` + `lng` + `radius_km`, `q` (text), `max_price`, `available_only`,
-`sort`.
+Send `lat`, `lng`, `radius_km` (and optionally `sort=distance`) on every feed
+call once the app has location permission.
 
-**`lat`/`lng`/`radius_km` is the important one.** Location-based discovery is the
-product's core premise in the MVP scope document and is not currently possible.
-The app already captures real device coordinates when a provider creates a
-listing (`VehicleCreateIn.latitude` / `longitude`), so the data will be there.
+### `completed_rentals` on the vehicle card
 
-### Masked calling
+The details screen renders a "completed rentals" trust signal. The product has
+**no bookings** (scope decision, confirmed 21 Aug 2026), so this number can
+never exist. Drop the field from the UI — the review count and average rating
+already fill the trust slot.
 
-The brief says all calls are routed through the app so personal numbers stay
-private. There is no endpoint, so this screen is a mock.
+---
 
-Needed: `POST /contact/call` taking a vehicle or provider id, returning a proxy
-number to dial or a call id.
+## P2 — vehicle master data
 
-### Fields missing from vehicle responses
+`GET /api/v1/vehicle-masters?type_code=TRACTOR` returns the cascade:
 
-`VehicleCardOut` and `VehicleOut` are missing values the built UI displays. They
-currently render as `0`, which reads as "0 stars, 0 km" rather than "unknown".
+```
+vehicle_manufacturers
+└── vehicle_models        (fuel_type, power_hp, vehicle_type_code)
+    └── vehicle_variants  (manufacture_year, power_hp)
+```
 
-| Field | Used by |
+The endpoints exist and the code is tested; what is missing is **data**: the
+seed script (`scripts/seed_master_data.py`) must be run against the target
+database. It is idempotent — safe to re-run.
+
+---
+
+## Done since the 17 Aug check (the rework)
+
+| Feature | Endpoint(s) |
 |---|---|
-| `rating`, `review_count` | Every card, search row, details header |
-| `distance_km` | Search rows and "nearby" copy — needs the caller's lat/lng |
-| `completed_rentals` | Details screen, provider trust signal |
-| `provider_name` | Nullable on the card today; always needed |
-| `provider_phone` | Masked calling |
+| Contact / call (replaces masked calling) | `POST /api/v1/contact/call` → returns the provider's real E.164 number to dial, records the call, notifies the provider (`CALL_INITIATED`) |
+| Vehicle master data | `GET /api/v1/vehicle-masters` |
+| Profile | `GET /api/v1/me` (session check), `PATCH /api/v1/me` (name, email, address, location) |
+| Favourites | `POST /api/v1/vehicles/{id}/favourite`, `DELETE /api/v1/vehicles/{id}/favourite`, `GET /api/v1/favourites` |
+| Reviews | `GET` / `POST /api/v1/vehicles/{id}/reviews` |
+| Notifications | `GET /api/v1/notifications`, `PATCH /api/v1/notifications/{id}/read`, `PATCH /api/v1/notifications/read-all` |
+| Provider dashboard | `GET /api/v1/provider/summary` (totals, availability, favourites, calls, review stats) |
+| Feed stats | `rating`, `review_count` on every card; `distance_km` when lat/lng sent |
 
----
+**Bookings are gone, deliberately.** The six booking screens (availability,
+summary, confirmation, my bookings, details, provider requests) must be removed
+from the app — there is no booking system in the product anymore. The backend
+bookings tables were dropped in migration `b7c2d4e6f8a0`.
 
-## P2 — bookings
-
-No endpoints exist. Six built screens run on mock data: availability, summary,
-confirmation, my bookings, booking details, and the provider's incoming
-requests.
-
-| Method | Path | Purpose |
-|---|---|---|
-| `GET` | `/vehicles/{id}/availability?date=` | Which 4-hour sessions are free |
-| `POST` | `/bookings` | Create a request |
-| `GET` | `/bookings` | Renter's own, filterable by status |
-| `GET` | `/bookings/{id}` | Detail + stage timeline |
-| `GET` | `/provider/bookings` | Provider's incoming requests |
-| `PATCH` | `/provider/bookings/{id}` | Accept / reject |
-| `PATCH` | `/bookings/{id}/cancel` | Renter cancels |
-
-A booking needs: vehicle, renter, date, session, duration, amount, status
-(`PENDING` / `ACCEPTED` / `ACTIVE` / `COMPLETED` / `REJECTED` / `CANCELLED`),
-a reference like `AGR-24817`, and optional renter notes.
-
-**Decide before building:** the MVP scope document lists booking as *post-MVP*,
-but the Figma has six booking screens drawn and the app has them built. These
-two disagree and it is not the backend's call to make.
-
----
-
-## P3 — features with no endpoints
-
-- **Favourites** — `GET /favourites`, `POST` / `DELETE /vehicles/{id}/favourite`.
-  The screen currently shows the first three listings as a placeholder.
-- **Notifications** — `GET /notifications`, plus mark-read
-- **Reviews** — `GET` / `POST /vehicles/{id}/reviews`
-- **Profile editing** — only `GET /auth/me` exists; no way to update name,
-  email or location
-- **Provider dashboard stats** — total vehicles, active rentals, completed,
-  lifetime earnings. Derivable from bookings once those exist, but one
-  `GET /provider/summary` would save four calls on the dashboard.
+**The role is now `USER` (was `RENTER`).** Tokens and OTP requests carry
+`role: "USER"` or `"PROVIDER"`. Old `RENTER` values in the database are renamed
+by the migration.
 
 ---
 
@@ -142,25 +111,32 @@ two disagree and it is not the backend's call to make.
   already exists, but the app has no localisation layer. Worth a product
   decision — and three types have no Tamil name yet (`BALER`, `LEVELLER`,
   `WATER_TANKER`).
-- **`GET /provider/vehicles` scoping** — confirm it is scoped to the token's
-  provider. The app assumes so.
-- **Listing status transitions** — `ListingStatus` has `PENDING_REVIEW` and
-  `APPROVED`, but nothing in the mobile API moves between them. Consistent with
-  admin living in a separate web panel; please confirm that is the plan.
-- **`price_unit: TRIP`** is in the enum — is it actually offered? It changes the
-  booking maths.
+- **`GET /provider/vehicles` scoping** — confirmed scoped to the token's
+  provider; a stranger's vehicle id returns 404.
+- **Provider phone exposure is now intentional.** `POST /contact/call` returns
+  the provider's real number so the caller can dial it directly. This replaces
+  the old privacy promise of masked calling — confirm the product wants the
+  real number exposed after a successful call record, or keep the number hidden
+  and re-introduce a proxy later.
+- **`price_unit: TRIP`** is in the enum — is it actually offered? With no
+  bookings it only affects the feed display.
 
 ---
 
 ## Confirmed working
 
-Verified end to end against the running server on 17 Aug.
+Verified end to end against the running server on 21 Aug 2026.
 
-- **Auth** — OTP request / verify / refresh / logout / me. Test code `0000`.
-- **Catalogue** — `GET /vehicles`, `/vehicles/{id}`, `/vehicle-types`. These are
-  **public**, so browsing works signed-out.
+- **Auth** — OTP request / verify / refresh / logout / me, and `GET /me` in
+  the profile module. Test code `0000`.
+- **Catalogue** — `GET /vehicles`, `/vehicles/{id}`, `/vehicle-types`,
+  `/vehicle-masters`. These are **public**, so browsing works signed-out.
 - **Provider vehicles** — list, create, update, delete, availability toggle.
-  (Create is blocked in practice by the P0 image rule above.)
+  (Create is blocked in practice by the P0 Cloudinary rule above.)
+- **Contact** — `POST /contact/call` records the call and returns the
+  provider's number.
+- **Social** — favourites, reviews, notifications, profile update, provider
+  summary.
 
 Notes worth keeping for whoever tests next:
 
@@ -168,8 +144,10 @@ Notes worth keeping for whoever tests next:
   `POST /auth/otp/request`, or the second attempt returns no token.
 - The `role` sent on the OTP **request** sets `active_role` on the token.
   Requesting with `PROVIDER` yields a provider session.
-- Test account `9876543210` is **Vasanth**, `roles: ["PROVIDER","RENTER"]`.
 - Access token 900s, refresh 30 days.
+- Master-data fields on a vehicle (`manufacturer_id`, `model_id`, `variant_id`)
+  are optional; when given, the backend validates the combination and overwrites
+  `brand`/`model` with the canonical master names.
 
 ## One note on error handling
 

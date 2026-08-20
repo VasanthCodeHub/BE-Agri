@@ -50,7 +50,7 @@ async def request_otp(
 ) -> OtpRequestOut:
     """Send a one-time code to a phone number.
 
-    A role (`RENTER` or `PROVIDER`) must be chosen here. It is stored against
+    A role (`USER` or `PROVIDER`) must be chosen here. It is stored against
     the code, so it cannot be changed at verification time.
 
     The phone number is accepted in any common form — `9876543210`,
@@ -73,7 +73,7 @@ async def request_otp(
     response_model=LoginOut,
     summary="Step 2 — verify the code and log in",
     responses={
-        400: {"description": "Code wrong, expired, already used, or name missing"},
+        400: {"description": "Code wrong, expired, or already used"},
         403: {"description": "Account suspended"},
     },
 )
@@ -100,12 +100,7 @@ async def verify_otp(
     return await service.verify_otp(
         phone_e164=payload.phone,
         code=payload.code,
-        name=payload.name,
         user_agent=user_agent,
-        email=payload.email,
-        address=payload.address,
-        latitude=payload.latitude,
-        longitude=payload.longitude,
     )
 
 
@@ -169,8 +164,8 @@ async def me(
     - `401 TOKEN_EXPIRED` → call `/auth/refresh`, then retry
     - `401` again → show the login screen
 
-    `profile_complete` tells the app whether to route the user to a
-    profile-completion screen first.
+    `onboarding.needs_profile_completion` tells the app whether to route the
+    user to a profile-completion screen first.
 
     Call this on app start and cache the result; it is not meant for every
     screen transition.

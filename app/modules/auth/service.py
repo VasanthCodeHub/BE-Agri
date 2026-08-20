@@ -62,8 +62,8 @@ class AuthService:
     async def request_otp(self, *, phone_e164: str, role: UserRole) -> OtpRequestOut:
         """Issue and send a one-time code.
 
-        Also tells the app whether this is a new number, so it knows whether to
-        collect a name before verifying.
+        Also tells the app whether this is a new number. Profile fields are
+        never collected here — the app completes them via PATCH /me after login.
         """
         user = await self.repo.get_user_by_phone(phone_e164)
         is_new_user = user is None
@@ -109,9 +109,9 @@ class AuthService:
         return OtpRequestOut(
             phone=mask_phone(phone_e164),
             is_new_user=is_new_user,
-            # Ask for a name if we don't have one yet — covers both a brand new
-            # number and an older account that never supplied one.
-            name_required=is_new_user or not (user and user.full_name),
+            # Always False: profile fields (name/email/location) are collected
+            # AFTER login through PATCH /me, never before verification.
+            name_required=False,
             otp_sent=True,
             expires_in=self.settings.otp_ttl_seconds,
         )
@@ -124,12 +124,7 @@ class AuthService:
         *,
         phone_e164: str,
         code: str,
-        name: str | None,
         user_agent: str | None,
-        email: str | None = None,
-        address: str | None = None,
-        latitude: float | None = None,
-        longitude: float | None = None,
     ) -> LoginOut:
         otp = await self.repo.get_active_otp(phone_e164)
         if otp is None:
@@ -179,26 +174,20 @@ class AuthService:
         await self.repo.consume_otp(otp)
 
         # The role comes from the OTP record, NOT from this request — so a
-        # client cannot request a code as RENTER and verify as PROVIDER.
+        # client cannot request a code as USER and verify as PROVIDER.
         role = otp.requested_role
 
         user = await self.repo.get_user_by_phone(phone_e164)
         is_new_user = user is None
 
         if user is None:
-            if not name:
-                raise BadRequestError(
-                    "Please provide your name to complete registration.",
-                    code="NAME_REQUIRED",
-                )
+            # No profile fields here: verify only authenticates. The account is
+            # created bare, and the app completes the profile afterwards via
+            # PATCH /me.
             user = await self.repo.create_user(
                 phone_e164=phone_e164,
-                full_name=name,
+                full_name=None,
                 role=role,
-                email=email,
-                address=address,
-                latitude=latitude,
-                longitude=longitude,
             )
             log.info("user_registered", user_id=str(user.id), role=role.value)
         else:
@@ -214,15 +203,6 @@ class AuthService:
             if not user.has_role(role):
                 await self.repo.grant_role(user, role)
                 log.info("role_granted", user_id=str(user.id), role=role.value)
-            if name and not user.full_name:
-                await self.repo.set_name(user, name)
-            await self.repo.update_profile(
-                user,
-                email=email,
-                address=address,
-                latitude=latitude,
-                longitude=longitude,
-            )
             await self.repo.touch_login(user)
 
         tokens = await self._issue_session(user=user, role=role, user_agent=user_agent)

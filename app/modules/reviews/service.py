@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from sqlalchemy import select
+
 from app.core.config import Settings
 from app.core.exceptions import BadRequestError, ConflictError, NotFoundError
 from app.core.logging import get_logger
 from app.modules.reviews.models import Review
 from app.modules.reviews.repository import ReviewRepository
 from app.modules.reviews.schemas import ReviewCreateIn, ReviewOut, ReviewPage
-from app.modules.vehicles.models import Vehicle
 from app.modules.vehicles.repository import VehicleRepository
 
 log = get_logger(__name__)
@@ -31,9 +32,7 @@ class ReviewService:
                 code="CANNOT_REVIEW_OWN_VEHICLE",
             )
 
-        existing = await self.repo.user_reviewed_vehicle(
-            user_id=reviewer.id, vehicle_id=vehicle_id
-        )
+        existing = await self.repo.user_reviewed_vehicle(user_id=reviewer.id, vehicle_id=vehicle_id)
         if existing is not None:
             raise ConflictError(
                 "You have already reviewed this vehicle.",
@@ -60,9 +59,7 @@ class ReviewService:
 
         return ReviewOut.from_model(review)
 
-    async def list_reviews(
-        self, *, vehicle_id, limit: int, offset: int
-    ) -> ReviewPage:
+    async def list_reviews(self, *, vehicle_id, limit: int, offset: int) -> ReviewPage:
         items, total = await self.repo.get_for_vehicle(
             vehicle_id=vehicle_id,
             limit=limit,

@@ -8,11 +8,9 @@ from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
-from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError
 from app.core.logging import get_logger
 from app.db.session import get_db
 from app.modules.auth.dependencies import require_role
-from app.modules.reviews.models import Review
 from app.modules.reviews.repository import ReviewRepository
 from app.modules.reviews.schemas import ReviewCreateIn, ReviewOut, ReviewPage
 from app.modules.reviews.service import ReviewService
@@ -57,7 +55,7 @@ async def list_reviews(
 async def create_review(
     vehicle_id: uuid.UUID,
     payload: ReviewCreateIn,
-    renter: User = Depends(require_role(UserRole.RENTER)),
+    reviewer: User = Depends(require_role(UserRole.USER)),
     service: ReviewService = Depends(get_review_service),
 ) -> ReviewOut:
-    return await service.create_review(reviewer=renter, vehicle_id=vehicle_id, payload=payload)
+    return await service.create_review(reviewer=reviewer, vehicle_id=vehicle_id, payload=payload)

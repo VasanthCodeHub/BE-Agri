@@ -1,0 +1,1593 @@
+﻿================================================================================
+AGRI — FRONTEND API INTEGRATION SPECIFICATION (COMPLETE)
+================================================================================
+Version      : 1.0
+Date         : 2026-08-21
+Scope        : Every API the mobile app uses, end to end, for the other agent
+               to implement/update the complete frontend API integration.
+Audience     : One implementation-focused agent (Codex). Read this file plus
+               the project, implement without further clarification.
+Rule         : Do NOT modify any backend source. Backend is DONE and tested.
+================================================================================
+
+--------------------------------------------------------------------------------
+0. HOW THIS SPEC WAS BUILT (READ FIRST)
+--------------------------------------------------------------------------------
+0.1 Source of truth
+    Every endpoint, field, enum, error code and rule in this spec was
+    extracted from the ACTUAL backend implementation in this repository:
+      - app/api/v1/router.py            (mount table - the complete API surface)
+      - app/main.py                     (error shape, tokens doc, / root)
+      - app/api/health.py               (/health, /ready)
+      - app/core/exceptions.py          (the one error envelope)
+      - app/core/config.py              (defaults: TTLs, OTP rules, folder)
+      - app/modules/{auth,profile,vehicles,masters,contact,uploads,
+        favourites,reviews,notifications,provider}/{router,service,schemas}.py
+      - app/integrations/cloudinary.py  (signing + delivery URLs)
+    If this spec and the code ever disagree, the CODE wins. The running server
+    also publishes /openapi.json and /docs - diff against those when unsure.
+
+0.2 Frontend project status
+    The mobile client is Flutter, developed by a separate team
+    (docs/PROJECT.md line 11). No Flutter codebase is present in this
+    workspace (D:\softsuave holds only BE-Agri; mvp\ contains only the product
+    PDF). Therefore:
+      - Every FRONTEND artifact below is written as a [LOCATION] to find in
+        the Flutter project, with the exact responsibility it must have. Do
+        NOT invent file names or classes; map each [LOCATION] to the real
+        file. If a [LOCATION] has no existing implementation, IMPLEMENT it in
+        the style of the project and record what was created.
+      - Backend file paths ARE real and verifiable (section 22).
+
+0.3 Global conventions the FE must follow
+    - Base URL: http://<host>:8000/api/v1 (prefix configurable via
+      api_v1_prefix, default "/api/v1" - app/core/config.py:74).
+    - Auth header: "Authorization: Bearer <access_token>" on every protected
+      call (HTTPBearer, app/modules/auth/dependencies.py).
+    - Every error response has ONE envelope (section 15.1). Branch on
+      error.code, never on message.
+    - Prices are integer paise, never floats (Rs.500 = 50000).
+    - Image assets are referenced by Cloudinary public_id (a path), NEVER a
+      URL, in request bodies; URLs are server-built in responses (url,
+      thumb_url).
+    - Phone numbers: accepted in any common format, normalised server-side to
+      E.164; responses return them MASKED (e.g. "+9198****3210").
+    - Pagination envelope (where used): { "items": [...], "total": int,
+      "limit": int, "offset": int }, limit max 100. Exceptions: notifications
+      (items + total only) and favourites (plain list) - documented in their
+      sections.
+    - No bookings anywhere. The product has NO booking flow. Contact = call.
+
+--------------------------------------------------------------------------------
+1. AUTHENTICATION (COMPLETE FLOW)
+--------------------------------------------------------------------------------
+Backend files: app/modules/auth/router.py, auth/service.py, auth/schemas.py,
+               profile/router.py, users/models.py
+
+1.0 The one-phone rule (backend-enforced, FE must respect)
+    - One phone number = one account (users.phone_e164 UNIQUE).
+    - Roles live on the account: USER, PROVIDER, or USER + PROVIDER
+      (UserRole enum, users/models.py:34-35; user_roles unique (user_id,
+      role)).
+    - Selecting another role NEVER creates another account. Verify finds-or-
+      creates by phone, then grants the missing role if absent.
+    - The role is chosen BEFORE the phone screen and sent with the OTP
+      REQUEST; the backend stores it on the OTP row (requested_role) and
+      verification uses that stored role. The role can never be changed or
+      sent again at verify (sending it there is a 422).
+    - OTP verification ONLY authenticates. Profile fields are NEVER collected
+      before or during verification (name_required is always false,
+      deprecated).
+
+1.1 POST /api/v1/auth/otp/request - Step 1: request a code
+    Auth        : none.
+    Purpose     : Send a one-time code for a phone + chosen role.
+    Request body:
+      { "phone": "9876543210", "role": "USER" }        # role REQUIRED
+    Response 200 (OtpRequestOut):
+      { "phone": "+9198****3210",     # masked - display back to the user
+        "is_new_user": true,          # false when the number logged in before
+        "name_required": false,       # DEPRECATED - always false, ignore it
+        "otp_sent": true,
+        "expires_in": 300 }           # seconds until the code expires
+    Errors:
+      422 VALIDATION_ERROR (invalid phone; missing/unknown role)
+      403 ACCOUNT_SUSPENDED          (user suspended - do not retry)
+      503 OTP_SEND_FAILED            (SMS gateway - safe to retry as-is)
+    FE behavior:
+      Screen: Role Selection then Phone (section 14).
+      Call when: the user submits the phone number.
+      Success: show the masked phone with a "Change" action; go to the OTP
+        screen; start the expires_in countdown. is_new_user changes NO UI.
+      Failure: inline error; retry button for 503; resend keeps phone + role.
+      Dev note: locally the code is printed in the server terminal and the
+      dev bypass OTP_DEV_BYPASS_CODE (default "0000") verifies any number.
+      Do not hard-code the bypass into the app; it is a dev-only server
+      setting.
+
+1.2 POST /api/v1/auth/otp/verify - Step 2: verify and open a session
+    Auth        : none.
+    Purpose     : Prove the phone, create the account if new, return tokens.
+    Request body (ONLY these two fields - extra="forbid"; any other field,
+    including role, name, email, address, location => 422):
+      { "phone": "9876543210", "code": "0000" }
+    Response 200 (LoginOut):
+      { "is_new_user": true,
+        "access_token": "<jwt>",
+        "refresh_token": "<opaque>",
+        "token_type": "bearer",
+        "expires_in": 900,              # access token TTL (seconds)
+        "refresh_expires_in": 2592000,  # refresh token TTL (30 days)
+        "user": {                       # UserOut - see 1.5
+          "id": "<uuid>", "phone": "+9198****3210",
+          "full_name": null, "email": null, "address": null,
+          "roles": ["USER"], "active_role": "USER",
+          "profile_complete": false,
+          "onboarding": { "profile_completed": false,
+                          "needs_profile_completion": true } } }
+    Errors:
+      400 OTP_NOT_FOUND          (no active code - request a new one)
+      400 OTP_ATTEMPTS_EXCEEDED  (too many wrong guesses - request a new code)
+      400 OTP_INVALID            (details.remaining_attempts - show count)
+      403 ACCOUNT_SUSPENDED
+    FE behavior:
+      Screen: OTP (section 14). 4-digit entry; the code is 4-8 digits
+        server-side.
+      Success: persist BOTH tokens in the existing session store (1.4), then
+        call GET /me (1.5) as the first authenticated call.
+      Failure: map codes per above; OTP_NOT_FOUND / OTP_ATTEMPTS_EXCEEDED
+        offer "Request a new code" reusing the same phone + role (call 1.1
+        again).
+      After verify: store tokens -> GET /me -> check onboarding -> if
+        needs_profile_completion == true -> Add Profile screen -> PATCH /me
+        -> continue to the app home for active_role.
+
+1.3 Tokens (access + refresh)
+    - access_token: JWT, ~15 min (access_token_ttl_minutes=15,
+      app/core/config.py:92). Sent as "Authorization: Bearer <token>".
+    - refresh_token: opaque, 30 days (refresh_token_ttl_days=30). Used ONLY
+      against POST /auth/refresh. Store securely; never send as Bearer.
+    - Expiry values come from the server in verify/refresh responses - use
+      them to schedule pre-emptive refresh if the FE architecture supports
+      it, otherwise refresh on 401.
+
+1.4 POST /api/v1/auth/refresh - get a fresh pair
+    Auth        : none (the refresh token IS the credential).
+    Request body: { "refresh_token": "<opaque>" }
+    Response 200: TokenPairOut - same shape as verify's token fields
+      (access_token, refresh_token NEW, token_type, expires_in,
+      refresh_expires_in). The old refresh token is ROTATED (invalidated).
+    Errors:
+      401 TOKEN_INVALID  (unknown/revoked - force re-login)
+      401 TOKEN_REUSED   (token already exchanged - the whole family is
+                          revoked; force re-login)
+      401 TOKEN_EXPIRED  (30 days passed - force re-login)
+    FE behavior:
+      Trigger: any API call returns 401 with code TOKEN_EXPIRED.
+      Serialize refreshes (one in-flight refresh shared by concurrent
+      callers); atomically replace BOTH stored tokens; retry the original
+      request ONCE. On any refresh failure: clear the session, go to Role
+      Selection. [LOCATION] the API client/interceptor where the
+      Authorization header is attached - hook the refresh there; do not add a
+      second networking layer.
+
+1.5 GET /api/v1/me - the session check (source of truth)
+    Auth        : Bearer token. (Identical GET /api/v1/auth/me exists.)
+    Purpose     : Who am I - roles, active role, onboarding state.
+    Response 200 (UserOut):
+      { "id": "<uuid>", "phone": "+9198****3210",
+        "full_name": "Ravi Kumar" | null, "email": ... | null,
+        "address": ... | null,
+        "roles": ["USER"],            # EVERY role on the account
+        "active_role": "USER",        # the role of the CURRENT session
+        "profile_complete": false,
+        "onboarding": { "profile_completed": false,
+                        "needs_profile_completion": true } }
+    Errors: 401 TOKEN_MISSING / TOKEN_INVALID / TOKEN_EXPIRED.
+    FE behavior:
+      Call: once after verify, once at app start when tokens exist, and after
+      PATCH /me to confirm. Cache the result; do NOT call it on every screen
+      transition (backend router docstring: "Call this on app start and
+      cache the result; it is not meant for every screen transition").
+      Success: route by active_role + onboarding (section 13).
+      Failure: 401 TOKEN_EXPIRED -> refresh then retry once; else -> signed
+      out -> Role Selection.
+
+1.6 PATCH /api/v1/me - update profile (Add Profile screen)
+    Auth        : Bearer token.
+    Purpose     : Collect/update profile. THE ONLY profile write endpoint.
+    Request body (ProfileUpdateIn; all optional; extra="forbid"; null = leave
+    unchanged, "" = clear; whitespace collapsed on full_name/address; email
+    stripped + lowercased):
+      { "full_name": "Ravi Kumar",    # min 2 chars
+        "email": "ravi@example.com",
+        "address": "12 Gandhi St, Sulur",
+        "latitude": 11.0246, "longitude": 77.1252 }
+    Response 200 (ProfileOut):
+      { "full_name": "...", "email": "...", "address": "...",
+        "latitude": 11.0246, "longitude": 77.1252 }
+    Errors: 401; 422 (validation - per-field).
+    FE behavior:
+      Screen: Add Profile / Complete your profile (shown when
+      onboarding.needs_profile_completion == true).
+      Call when: the user taps Save on the profile form.
+      Success: update the cached user state locally (mirror the fields);
+        navigate to the role home; the next GET /me confirms
+        profile_completed=true.
+      Failure: inline field errors for 422; generic error banner otherwise;
+        retry keeps entered values. Disable Save while in flight (no double
+        submit).
+      Lat/lng: attach current coordinates from the FE location service when
+        permission is granted; profile completion does NOT depend on lat/lng
+        (completion = full_name AND email AND address all present).
+
+1.7 POST /api/v1/auth/logout - end the session
+    Auth        : none (refresh token in body).
+    Request body: { "refresh_token": "<opaque>", "all_devices": false }
+    Response: 204 ALWAYS (even if the token was unknown - do not branch on it).
+    FE behavior: clear the local session, navigate to Role Selection. The
+      access token may stay usable a few minutes server-side by design;
+      ignore that.
+
+1.8 Session persistence (auth state)
+    [LOCATION] the existing session/token store (the current auth
+    implementation already has one - REUSE it, do not create a second).
+    It must persist: access_token, refresh_token, and ideally the expiry
+    deltas. Auth state derives from this store + GET /me:
+      logged out          -> no tokens
+      OTP pending         -> tokens absent, user inside the otp flow
+      authenticated       -> tokens present
+      profile incomplete  -> tokens present AND onboarding needs completion
+      profile complete    -> tokens present AND onboarding complete
+      role state          -> from cached UserOut: roles / active_role
+--------------------------------------------------------------------------------
+2. VEHICLE MASTER DATA (ADD-VEHICLE FORM DROPDOWNS)
+--------------------------------------------------------------------------------
+Backend files: app/modules/masters/router.py, masters/service.py,
+               masters/schemas.py, vehicles/router.py (GET /vehicle-types)
+
+2.1 GET /api/v1/vehicle-masters - the dropdown tree
+    Auth        : none (public - the provider needs it before logging in to
+                  fill the form; the data is not sensitive).
+    Purpose     : Manufacturers -> models -> variants for the Add Vehicle form.
+    Query params: type_code (optional; e.g. "TRACTOR") narrows the tree to
+                  models of one vehicle type (uppercased server-side).
+    Response 200 (VehicleMastersOut):
+      { "manufacturers": [
+          { "id": "<uuid>", "name": "Mahindra",
+            "models": [
+              { "id": "<uuid>", "name": "575 DI",
+                "vehicle_type_code": "TRACTOR",     # filters the type picker
+                "fuel_type": "DIESEL",
+                "power_hp": 47,
+                "variants": [
+                  { "id": "<uuid>", "name": "575 DI Super",
+                    "manufacture_year": 2021, "power_hp": 50 } ] } ] } ] }
+    Errors: none expected (400-level only from internal misuse).
+    FE behavior:
+      Screen: Add Vehicle form.
+      Call when: the Add Vehicle screen opens (or before it; the tree is
+        cacheable).
+      Cascade (dependent dropdowns - RESET rule):
+        - Selecting a MANUFACTURER: show only ITS models; RESET the selected
+          model, variant (and any type selection) to unselected.
+        - Selecting a MODEL: show only ITS variants; RESET the selected
+          variant. vehicle_type_code, fuel_type and power_hp are DERIVED from
+          the model server-side when the listing is submitted - the FE shows
+          them read-only (from the model row) or hides them; the FE never
+          submits its own values for them on the master path.
+        - Selecting a VARIANT: optionally prefill manufacture_year / power_hp;
+          nothing else to reset.
+      Cache: masters data changes rarely. Cache after the first fetch and
+      refresh on pull-to-refresh or when a 400 MANUFACTURER_NOT_FOUND /
+      VEHICLE_MODEL_NOT_FOUND / VEHICLE_VARIANT_NOT_FOUND arrives (a stale id
+      is a client bug worth surfacing - masters/service.py:100-101).
+
+2.2 GET /api/v1/vehicle-types - the type picker
+    Auth        : none (public).
+    Purpose     : Vehicle type codes for the form's type selector.
+    Response 200: [ { "id": "<uuid>", "code": "TRACTOR",
+                      "name_en": "Tractor", "name_ta": "<Tamil>" }, ... ]
+    FE behavior: the type picker is filtered by the selected model's
+      vehicle_type_code (see masters schema). On the FREE-TEXT path (no
+      model/variant chosen) the FE may offer all codes and submit the chosen
+      code in vehicle_type_code. Seeded types include TRACTOR, HARVESTER,
+      BACKHOE_LOADER, CULTIVATOR, OTHER (codes are stable machine keys; send
+      the CODE, not the id, when submitting).
+
+2.3 Master vs free-text path (create-vehicle contract detail)
+    - Master path: model_id and/or variant_id chosen -> backend derives
+      brand, model, vehicle_type_code, fuel_type, power_hp from the master
+      rows; a conflicting client-sent vehicle_type_code is REJECTED with 400
+      INVALID_MASTER_COMBINATION.
+    - Free-text path: no model/variant -> the FE MUST send all of
+      vehicle_type_code, brand, model, fuel_type, power_hp (else 422
+      VALIDATION_ERROR per field).
+    - Errors from master resolution (400): MANUFACTURER_NOT_FOUND,
+      VEHICLE_MODEL_NOT_FOUND, VEHICLE_VARIANT_NOT_FOUND,
+      INVALID_MASTER_COMBINATION (details show the conflicting ids/codes).
+      On any of these: refetch /vehicle-masters and reset the cascade.
+
+--------------------------------------------------------------------------------
+3. PROVIDER VEHICLES (OWN LISTINGS)
+--------------------------------------------------------------------------------
+Backend files: app/modules/vehicles/router.py, vehicles/service.py,
+               vehicles/schemas.py
+
+3.0 Provider-only + ownership (backend-enforced)
+    - Every /provider/vehicles* endpoint requires the PROVIDER role
+      (require_role(UserRole.PROVIDER)); otherwise 403 ROLE_REQUIRED with
+      details.required_role.
+    - Ownership is enforced in the service layer (get_owned by
+      provider_user_id); another provider's vehicle is indistinguishable from
+      a missing one: 404 VEHICLE_NOT_FOUND. The FE does NOT filter client-
+      side - the server does.
+    - The provider sees VehicleOut (owner view). The public sees
+      VehicleCardOut. NEVER show registration_number / rc_number /
+      engine_number / chassis_number / rc_document_public_id on any public
+      surface (they exist only in VehicleOut).
+
+3.1 POST /api/v1/provider/vehicles - add a vehicle
+    Auth: PROVIDER.  Success: 201 VehicleOut.
+    Request body (VehicleCreateIn - required fields):
+      { "name": "Mahindra 575 DI",
+        "manufacturer_id": "<uuid> | null",      # master path (2.3)
+        "model_id": "<uuid> | null",
+        "variant_id": "<uuid> | null",
+        "vehicle_type_code": "TRACTOR | null",   # derived on master path
+        "brand": "Mahindra | null",              # derived on master path
+        "model": "575 DI | null",                # derived on master path
+        "manufacture_year": 2019,                # 1950..2100
+        "registration_number": "TN 38 AB 1234",  # any format; normalised
+        "rc_number": null, "rc_document_public_id": null,   # private, owner-only
+        "engine_number": null, "chassis_number": null,      # private, owner-only
+        "note": "Well maintained. Rotavator included.",     # 1..1000 chars
+        "price_amount": 50000,                   # PAISE (Rs.500 = 50000)
+        "price_unit": "HOUR",                    # HOUR|DAY|ACRE|TRIP
+        "location_text": "Sulur, Coimbatore",
+        "fuel_type": null,                       # DIESEL|PETROL|ELECTRIC|CNG
+        "power_hp": null,                        # derived on master path; 0 ok
+        "transmission": "MANUAL",                # MANUAL|AUTOMATIC
+        "image_public_ids": ["agri/vehicles/<hex>"],  # 0..6 ids (NOT URLs)
+        "latitude": 11.0246, "longitude": 77.1252 }
+    Errors:
+      400 IMAGE_NOT_RECOGNISED       (an id is not inside the signed upload
+                                      folder - details.public_ids)
+      409 REGISTRATION_ALREADY_LISTED (details.registration_number)
+      400 VEHICLE_TYPE_UNKNOWN       (type cannot be determined / unknown code)
+      400 MANUFACTURER_NOT_FOUND / VEHICLE_MODEL_NOT_FOUND /
+          VEHICLE_VARIANT_NOT_FOUND / INVALID_MASTER_COMBINATION
+      422 VALIDATION_ERROR           (missing fields, bad enums, duplicate
+                                      image ids, bad registration plate)
+    FE behavior:
+      Screen: Add Vehicle (multistep: master cascade -> spec fields -> photos
+      -> submit). Loading: disable submit while in flight. Success: insert
+      into the local My Vehicles list (or refetch the list), navigate to the
+      vehicle detail/list; the vehicle is listed immediately as APPROVED
+      (ListingStatus.APPROVED default; moderation arrives Phase 5).
+      Failure: map errors per above; 409 shows "already listed" on the
+      registration field; 400s from masters -> refetch masters + reset the
+      cascade; 422 -> per-field messages. NO double submit.
+
+3.2 GET /api/v1/provider/vehicles - my vehicles
+    Auth: PROVIDER.  Success 200 VehiclePage:
+      { "items": [ VehicleOut ... ], "total": 40, "limit": 20, "offset": 0 }
+    Query params: limit (1..100, default 20), offset (>= 0, default 0).
+    FE behavior:
+      Screen: My Vehicles (provider home list). Call on screen appearance and
+      after create/edit/delete/availability changes (or update state locally
+      from the mutation response - see 17). Pagination: offset/limit paging
+      or infinite scroll using total; refresh on pull-to-refresh.
+      Failure: error state with Retry; keep previous items if a refresh fails.
+
+3.3 GET /api/v1/provider/vehicles/{vehicle_id} - one of mine
+    Auth: PROVIDER.  Success 200 VehicleOut (owner view - all fields).
+    Errors: 401, 403 ROLE_REQUIRED, 404 VEHICLE_NOT_FOUND (also when owned by
+      another provider - do not leak).
+    FE behavior: the Edit Vehicle screen loads this to prefill. Owner-only
+      fields (registration_number, rc_number, rc_document_public_id,
+      engine_number, chassis_number) may be shown HERE - never elsewhere.
+
+3.4 PATCH /api/v1/provider/vehicles/{vehicle_id} - edit
+    Auth: PROVIDER (owner).  Success 200 VehicleOut.
+    Request body (VehicleUpdateIn - every field optional; send only what
+      changed; null = leave unchanged):
+      name, vehicle_type_code, manufacturer_id, model_id, variant_id, brand,
+      model, manufacture_year, registration_number (normalised; duplicates
+      checked EXCLUDING this vehicle - editing the plate of one's own
+      vehicle is allowed), rc_number, rc_document_public_id, engine_number,
+      chassis_number, note, price_amount, price_unit, location_text,
+      latitude, longitude, fuel_type, power_hp, transmission, is_available,
+      image_public_ids (REPLACES all photos; [] clears).
+    Errors: same set as create (3.1) plus 404 VEHICLE_NOT_FOUND; master-field
+      changes re-derive type/fuel/power and validate the chain.
+    FE behavior: Edit Vehicle screen -> prefill from 3.3 -> PATCH on Save ->
+      update the list state from the VehicleOut response. Photo replacement:
+      image_public_ids is sent once uploads complete (section 5).
+
+3.5 PATCH /api/v1/provider/vehicles/{vehicle_id}/availability - toggle
+    Auth: PROVIDER (owner).  Success 200 VehicleOut.
+    Query param: is_available=true|false (true puts it back on the public
+      feed).
+    Errors: 401, 403, 404 VEHICLE_NOT_FOUND.
+    FE behavior: availability switch on My Vehicles / detail. Loading on the
+      switch; optimistic updates are acceptable ONLY if reverted on failure
+      (section 7 pattern); success updates the row's is_available from the
+      response and dashboard counts catch up on the next summary fetch.
+
+3.6 DELETE /api/v1/provider/vehicles/{vehicle_id}
+    Auth: PROVIDER (owner).  Success 204 NO CONTENT (soft delete server-side).
+    Errors: 401, 403, 404 VEHICLE_NOT_FOUND.
+    FE behavior: confirmation dialog before calling. Success: remove from the
+      local list, navigate back; do NOT fetch the deleted vehicle again.
+      Failure: error banner; the vehicle stays in the list.
+
+--------------------------------------------------------------------------------
+4. PUBLIC VEHICLES (FEED + DETAIL)
+--------------------------------------------------------------------------------
+Backend files: app/modules/vehicles/router.py (GET /vehicles,
+               GET /vehicles/{id})
+
+4.1 GET /api/v1/vehicles - the public feed
+    Auth        : NONE (public, deliberately unauthenticated - browsing is
+                  anonymous; login is required only to contact a provider).
+    Purpose     : Browse discoverable listings (approved + available).
+    Query params (VehicleSearchParams):
+      type_code      (e.g. TRACTOR - uppercased)
+      lat, lng       (-90..90 / -180..180; enable geo search)
+      radius_km      (0 < r <= 500)
+      q              (text on name/brand/location; <= 100 chars)
+      max_price      (paise; > 0)
+      available_only (default TRUE)
+      sort           newest | distance | price_asc | price_desc (default
+                     newest)
+      limit (1..100, default 20), offset (>= 0)
+    Response 200 (VehicleCardPage):
+      { "items": [ VehicleCardOut ... ], "total": 123, "limit": 20,
+        "offset": 0 }
+      VehicleCardOut: id, name, vehicle_type {id, code, name_en, name_ta},
+      brand, model, manufacturer_id, model_id, variant_id, manufacture_year,
+      note, price_amount (paise), price_unit, price_label ("Rs.500 / hour" -
+      display this, do not re-format), location_text, fuel_type, power_hp,
+      transmission, images [{public_id, url, thumb_url}], provider_id (use
+      to initiate a call), provider_name, rating (1-5 | null), review_count,
+      distance_km (| null; present when lat/lng/radius supplied).
+    Errors: 422 for bad query params (e.g. radius_km = 0).
+    FE behavior:
+      Screen: Home feed (USER). Call on appearance with current lat/lng +
+      radius (MVP: "grant location or select manually"); pull-to-refresh;
+      infinite scroll via offset until offset + items >= total.
+      Use thumb_url in lists (400px - saves bandwidth), url on the detail
+      screen. Unavailable listings never appear - the server excludes them.
+
+4.2 GET /api/v1/vehicles/{vehicle_id} - detail
+    Auth        : NONE (public).
+    Purpose     : One listing for the detail screen.
+    Response 200: VehicleCardOut (same shape as 4.1; rating/review_count
+      included; NO registration number, NO provider phone, NO exact
+      coordinates, NO rc/engine/chassis - public view only).
+    Errors: 404 VEHICLE_NOT_FOUND (gone or no longer available).
+    FE behavior: the detail screen renders from the response (full-size
+      photos, price_label, note, provider_name, rating + review_count linking
+      to the reviews section). Call once per screen visit; caching not
+      required. Failure: friendly "listing unavailable" state.
+
+--------------------------------------------------------------------------------
+5. VEHICLE IMAGES - CLOUDINARY DIRECT UPLOAD
+--------------------------------------------------------------------------------
+Backend files: app/modules/uploads/router.py, uploads/service.py,
+               uploads/schemas.py, integrations/cloudinary.py
+
+5.0 The flow (image bytes NEVER pass through the backend)
+      Provider app  -> POST /provider/uploads/signature      (auth)
+      Provider app  <- UploadSignatureOut                    (authorisation)
+      Provider app  -> https://api.cloudinary.com/v1_1/{cloud_name}/image/upload
+                       (multipart: file + signed params - DIRECT, no backend)
+      Provider app  <- Cloudinary { public_id, ... }
+      Provider app  -> POST /provider/vehicles or PATCH .../vehicles/{id}
+                       with image_public_ids: [public_id]  (ids, not URLs)
+
+5.1 POST /api/v1/provider/uploads/signature
+    Auth        : PROVIDER role.  Request body: NONE (ignored if sent - the
+                  server chooses folder + public_id so a client cannot aim an
+                  upload at provider documents etc.).
+    Response 200 (UploadSignatureOut):
+      { "cloud_name": "agri-app", "api_key": "123456",
+        "timestamp": 1750000000, "signature": "<sha1 hex>",
+        "folder": "agri/vehicles", "public_id": "agri/vehicles/<32 hex>",
+        "upload_preset": null,          # null unless server-configured
+        "expires_in": 3600 }            # signature validity (seconds)
+    Errors: 401, 403 ROLE_REQUIRED, 503 CLOUDINARY_NOT_CONFIGURED.
+
+5.2 Direct Cloudinary upload (client-side, existing FE implementation)
+    - Endpoint: https://api.cloudinary.com/v1_1/{cloud_name}/image/upload
+      (multipart/form-data).
+    - Multipart fields: file (the image bytes) PLUS the signed params from
+      5.1: timestamp, signature, public_id (and upload_preset when non-null).
+    - The signature commits the server to exactly that public_id/timestamp;
+      do NOT alter them (Cloudinary rejects tampered params).
+    - Success: Cloudinary returns (among others) public_id - capture it; the
+      FE NEVER sends the URL anywhere; requests carry public_id only.
+    - The backend accepts ONLY public_ids inside the signed folder
+      (IMAGE_NOT_RECOGNISED otherwise).
+
+5.3 FE behavior requirements
+    - Image selection: picker (gallery/camera) per the existing app; multiple
+      images: 0..6 per vehicle (MAX_IMAGES = 6); the FIRST image is the card
+      thumbnail.
+    - Upload progress/loading: per-image progress indicator; a signature is
+      valid for expires_in (3600) seconds - request a fresh signature per
+      upload (safer than reusing).
+    - Upload failure (network, Cloudinary error, 401/403): mark the image as
+      failed, allow retrying that image; do NOT create the vehicle until all
+      wanted images succeeded (create allows an empty image_public_ids).
+    - Vehicle create/update dependency: collect all public_ids, then submit
+      them in POST / PATCH /provider/vehicles. On 400 IMAGE_NOT_RECOGNISED:
+      refetch the signature and re-upload.
+    - Cleanup: if vehicle create/update fails after uploads succeeded,
+      optionally delete the Cloudinary assets using the existing FE
+      implementation if it exists; otherwise leave them (orphaned assets are
+      acceptable in the MVP - do NOT block the flow on cleanup).
+--------------------------------------------------------------------------------
+6. CONTACT / PROVIDER CALL (NO BOOKINGS)
+--------------------------------------------------------------------------------
+Backend files: app/modules/contact/router.py, contact/service.py,
+               contact/schemas.py, notifications (CALL_INITIATED)
+
+6.1 POST /api/v1/contact/call
+    Auth        : ANY authenticated user (get_current_user - USER or
+                  PROVIDER; no role restriction).
+    Purpose     : Record the call intent and return the provider's number for
+                  the dialer. The number appears ONLY here, never on the feed.
+    Request body: { "vehicle_id": "<uuid>" }
+    Response 201 (ContactCallOut):
+      { "call_id": "<uuid>", "provider_id": "<uuid>",
+        "provider_name": "Ravi Kumar", "provider_phone": "+919876543210",
+        "vehicle_id": "<uuid>", "created_at": "2026-08-21T10:00:00Z",
+        "message": "Call the provider directly to negotiate terms." }
+      (message is human-readable - never branch logic on it.)
+    Errors:
+      401 TOKEN_MISSING / TOKEN_INVALID / TOKEN_EXPIRED
+      404 VEHICLE_NOT_FOUND        (vehicle gone or NOT on the public feed)
+      503 PROVIDER_NOT_CONTACTABLE (provider has no number on file)
+    Server side-effects: the call is recorded; the provider receives a
+    notification (type CALL_INITIATED, data {call_id, vehicle_id}).
+    FE behavior:
+      Screen: Vehicle Detail -> "Call provider" button.
+      Call when: the user taps Call.
+      Success: open the dialer (or the existing in-app calling
+        implementation) with provider_phone (E.164); the public feed never
+        shows this number.
+      Failure: 401 -> refresh flow; 404 -> reload the vehicle (it may have
+        become unavailable) and surface "not available"; 503 -> message.
+
+--------------------------------------------------------------------------------
+7. FAVOURITES
+--------------------------------------------------------------------------------
+Backend files: app/modules/favourites/router.py, favourites/service.py,
+               favourites/schemas.py
+
+7.1 POST /api/v1/vehicles/{vehicle_id}/favourite - toggle
+    Auth        : USER role (403 ROLE_REQUIRED otherwise).
+    Request body: none.  Response 200: { "favourited": true | false }
+      (the endpoint TOGGLES - the same call adds or removes; the response
+      says which).
+    Errors: 401, 403, 404 (missing vehicle), 422 (bad uuid).
+
+7.2 GET /api/v1/favourites - my favourites
+    Auth        : USER role.
+    Query params: limit (1..100), offset - accepted; NOTE the response is a
+      PLAIN LIST (no pagination envelope): [ FavouriteOut ... ]
+      FavouriteOut: { "id": "<uuid>", "vehicle": VehicleCardOut,
+                      "created_at": "..." }
+    FE behavior:
+      Toggle UI: heart/star on Vehicle Card + Detail. Recommended: OPTIMISTIC
+        update (flip the icon instantly), then reconcile with the response;
+        on failure roll back to the previous state and surface the error.
+      Refresh: the Favourites screen fetches 7.2 on appearance and on pull-
+        to-refresh; vehicle cards render with VehicleCardOut (same as feed).
+      After unfavouriting, remove the item from the Favourites list locally
+        (do not wait for a refetch).
+
+--------------------------------------------------------------------------------
+8. REVIEWS
+--------------------------------------------------------------------------------
+Backend files: app/modules/reviews/router.py, reviews/service.py,
+               reviews/schemas.py
+
+8.1 GET /api/v1/vehicles/{vehicle_id}/reviews
+    Auth        : NONE (public).
+    Query params: limit (1..100, default 20), offset (>= 0).
+    Response 200 (ReviewPage):
+      { "items": [ { "id": "<uuid>", "vehicle_id": "<uuid>",
+                     "reviewer_id": "<uuid>", "reviewer_name": "Ravi Kumar",
+                     "rating": 4, "comment": "Good tractor" | null,
+                     "created_at": "..." } ],
+        "total": 7, "limit": 20, "offset": 0 }
+    FE behavior: reviews section on Vehicle Detail; fetch on appearance;
+      pagination via offset (show more) or infinite scroll using total;
+      pull-to-refresh.
+
+8.2 POST /api/v1/vehicles/{vehicle_id}/reviews
+    Auth        : USER role.
+    Request body: { "rating": 4, "comment": "Good tractor" }
+      rating: int 1..5 REQUIRED; comment: str <= 500 chars, optional
+      (empty/whitespace stored as null).
+    Response 201: ReviewOut (as in 8.1 items).
+    Errors:
+      401, 403 ROLE_REQUIRED
+      404 VEHICLE_NOT_FOUND
+      400 CANNOT_REVIEW_OWN_VEHICLE (provider reviewing own listing)
+      409 REVIEW_ALREADY_EXISTS     (one review per user per vehicle)
+      422 VALIDATION_ERROR          (rating out of range, comment too long)
+    FE behavior: "Write a review" (star picker + comment) on Vehicle Detail;
+      require auth first (send to login on 401); disable submit while in
+      flight. Success: insert the returned review at the top of the list and
+      refresh the vehicle's rating/review_count (or refetch the detail); hide
+      the review form once the reviewer has already reviewed (the server also
+      409s). Failure: map 409 ("You have already reviewed") and 400 (own
+      vehicle) to messages; keep the draft on 422.
+
+--------------------------------------------------------------------------------
+9. NOTIFICATIONS
+--------------------------------------------------------------------------------
+Backend files: app/modules/notifications/router.py, notifications/service.py,
+               notifications/schemas.py, notifications/models.py
+
+9.1 GET /api/v1/notifications
+    Auth        : ANY authenticated user.
+    Query params: is_read (true|false filter, optional), limit, offset.
+      NOTE: the response has NO limit/offset echo - NotificationPage:
+      { "items": [ { "id": "<uuid>", "type": "CALL_INITIATED",
+                     "title": "Someone wants to call you",
+                     "body": "...", "data": { "call_id": ...,
+                       "vehicle_id": ... } | null,
+                     "is_read": false, "read_at": null,
+                     "created_at": "..." } ], "total": 3 }
+    Notification types seen in the backend: CALL_INITIATED, NEW_REVIEW
+      (strings; the FE must not hard-code beyond what it renders).
+    FE behavior: Notifications screen - fetch on appearance + pull-to-refresh;
+      unread badge count = items where is_read == false (or a filtered
+      is_read=false fetch); empty state when total == 0.
+
+9.2 PATCH /api/v1/notifications/{notification_id}/read
+    Auth        : ANY authenticated user (ownership enforced server-side).
+    Response 200: NotificationOut (the updated notification).
+    Errors: 404 NOTIFICATION_NOT_FOUND.
+    FE behavior: on tapping an unread notification, mark it read (fire-and-
+      forget acceptable; update the local row to is_read=true + read_at).
+
+9.3 PATCH /api/v1/notifications/read-all
+    Auth        : ANY authenticated user.
+    Response 200: { "marked_read": 3 }
+    FE behavior: "Mark all as read" action -> set all local rows to read;
+      failure -> error banner, keep state.
+
+--------------------------------------------------------------------------------
+10. PROVIDER DASHBOARD
+--------------------------------------------------------------------------------
+Backend files: app/modules/provider/router.py (ProviderSummaryOut)
+
+10.1 GET /api/v1/provider/summary
+    Auth        : PROVIDER role.
+    Purpose     : Dashboard stats scoped to the caller's OWN live listings.
+    Response 200 (ProviderSummaryOut - exact fields, nothing else):
+      { "total_vehicles": 6,          # live listings (not soft-deleted)
+        "available_vehicles": 4,      # currently on the public feed
+        "unavailable_vehicles": 2,    # toggled off by the provider
+        "favourite_count": 12,        # favourites across own vehicles
+        "contact_call_count": 5,      # calls initiated toward own vehicles
+        "review_count": 3,            # reviews about own vehicles
+        "average_rating": 4.33 }      # 1-5, NULL when no reviews exist
+    Errors: 401, 403 ROLE_REQUIRED.
+    FE behavior: Provider Home dashboard. Fetch on screen appearance and
+      pull-to-refresh; after vehicle create/delete/availability changes a
+      refetch keeps the counts honest. Map directly to dashboard tiles:
+      total_vehicles -> "My Vehicles" count; available_vehicles /
+      unavailable_vehicles -> status breakdown; favourite_count,
+      contact_call_count, review_count, average_rating -> interest /
+      reputation tiles. Do NOT derive any extra fields (e.g. no ratings sum -
+      use review_count + average_rating as returned).
+
+--------------------------------------------------------------------------------
+11. SYSTEM APIS (NOT FOR THE MOBILE APP)
+--------------------------------------------------------------------------------
+Backend files: app/api/health.py, app/main.py (GET /)
+
+11.1 GET /health - liveness. Always 200 if the process runs:
+     { "status": "ok", "app": "...", "version": "...", "environment": "..." }
+11.2 GET /ready - readiness. 200 { "ready": true, "checks": { "database":
+     "ok", "postgis": "ok" } } or 503 when the database is down.
+11.3 GET / - service banner: { service, version, environment, docs }.
+11.4 FE policy: the mobile app MUST NOT call any of these. They are
+     infrastructure probes for load balancers / dev tooling, unversioned on
+     purpose ("they are not part of the mobile API contract" - health.py
+     docstring). Dev/test scripts MAY use /health to wait for the server.
+--------------------------------------------------------------------------------
+12. API CLIENT ARCHITECTURE (DOCUMENT THE ACTUAL ONE)
+--------------------------------------------------------------------------------
+[LOCATION] Find the existing Flutter networking layer. Document and REUSE it
+exactly as it is; do NOT introduce a new architecture. This section lists the
+properties it must have - verify each against the real code and fill gaps in
+place:
+
+  - API client            : [LOCATION] (e.g. Dio / HttpClient wrapper). One
+                            instance; base URL = server host + "/api/v1".
+  - Base URL / env config : [LOCATION] environment/config handling (dev vs
+                            prod host). The api_v1_prefix is part of the
+                            backend URL; do not hard-code "/api/v1" twice.
+  - Headers               : Content-Type: application/json; Accept:
+                            application/json; Authorization: Bearer <token>
+                            injected per request for protected calls.
+  - Token injection       : [LOCATION] interceptor/request builder where the
+                            stored access token is attached.
+  - Refresh flow          : [LOCATION] - 401 TOKEN_EXPIRED -> POST
+                            /auth/refresh (serialized, section 1.4) -> retry
+                            once. Refresh failure -> clear session -> Role
+                            Selection.
+  - Retry behavior        : refresh-then-retry (1 retry). NO blind retries of
+                            non-idempotent calls; 503 OTP_SEND_FAILED may be
+                            retried by user action.
+  - JSON encoding/decoding: match the exact field names in this spec (the
+                            backend enforces extra="forbid" on most bodies -
+                            unknown fields yield 422).
+  - Error mapping         : one central mapper for the envelope (15.1) plus
+                            network/timeout errors -> user messages + codes.
+  - HTTP status handling  : 200/201/204 success; 4xx mapped by code; 5xx ->
+                            generic message.
+  - Logging               : follow the app's existing logging; never log
+                            tokens or full phone numbers.
+  - Timeout behavior      : follow the existing client timeouts; surface
+                            "network unavailable" states on timeout.
+  - Multipart/upload      : ONLY for the direct Cloudinary upload (section
+                            5.2); nothing else in the app uses multipart.
+
+--------------------------------------------------------------------------------
+13. AUTHENTICATION STATE
+--------------------------------------------------------------------------------
+[LOCATION] the existing auth/session state holder (auth controller / store /
+manager). It must expose these states and drive navigation:
+
+  State                 | Determined by
+  ----------------------+-----------------------------------------------------
+  logged out            | no tokens in the session store
+  otp pending           | tokens absent, user inside the auth flow (role +
+                        |   phone carried in memory; role immutable after
+                        |   Role Selection)
+  authenticated         | tokens present (store)
+  profile incomplete    | authenticated AND cached UserOut.onboarding.
+                        |   needs_profile_completion == true
+  profile complete      | authenticated AND onboarding complete
+  role: USER            | cached UserOut.active_role == "USER"
+  role: PROVIDER        | cached UserOut.active_role == "PROVIDER"
+  roles: USER+PROVIDER  | cached UserOut.roles contains both (the account
+                        |   holds both; active_role is the current session's)
+
+Navigation effects:
+  logged out                   -> Role Selection
+  otp pending                  -> Phone/OTP stack (back to Role Selection)
+  authenticated + incomplete   -> Add Profile screen before home
+  authenticated + complete     -> home for active_role
+  active_role USER             -> Home feed; favourites/reviews/call actions
+  active_role PROVIDER         -> Provider Home (summary) / My Vehicles
+  USER+PROVIDER account        -> switch experience by logging in with the
+                                  other role (no account duplication; roles
+                                  accumulate - verify grants the missing one)
+  App start                    -> tokens? GET /me (refresh on 401) : logged
+                                  out. GET /me 401 after refresh -> clear ->
+                                  Role Selection.
+
+--------------------------------------------------------------------------------
+14. NAVIGATION / SCREEN FLOW
+--------------------------------------------------------------------------------
+[LOCATION] the app's router/coordinator. Map each API call to its screen.
+Screen names below are product-level; use the actual class names when
+mapping.
+
+  Auth (both roles):
+    Role Selection -> Phone -> OTP -> [GET /me] -> Add Profile (if
+    needs_profile_completion) -> Home
+    Home (logged out) -> Role Selection; Logout -> Role Selection
+
+  USER:
+    Home (feed)             -> GET /vehicles (list, infinite scroll,
+                               pull-to-refresh, location radius)
+    Vehicle Detail          -> GET /vehicles/{id}
+      -> Favourite toggle   -> POST /vehicles/{id}/favourite
+      -> Reviews list       -> GET /vehicles/{id}/reviews
+      -> Write review       -> POST /vehicles/{id}/reviews
+      -> Call provider      -> POST /contact/call -> dialer
+    Favourites              -> GET /favourites
+    Notifications           -> GET /notifications; PATCH .../read;
+                               PATCH .../read-all
+    Profile (edit)          -> PATCH /me
+
+  PROVIDER:
+    Provider Home           -> GET /provider/summary
+    My Vehicles             -> GET /provider/vehicles (list)
+    Add Vehicle             -> GET /vehicle-masters (+ /vehicle-types);
+                               POST /provider/uploads/signature per photo;
+                               POST /provider/vehicles
+    Vehicle Detail (owner)  -> GET /provider/vehicles/{id}
+    Edit Vehicle            -> GET /provider/vehicles/{id} (prefill);
+                               PATCH /provider/vehicles/{id}
+    Availability toggle     -> PATCH /provider/vehicles/{id}/availability
+    Delete                  -> DELETE /provider/vehicles/{id}
+    Notifications           -> same as USER
+    Profile (edit)          -> PATCH /me
+
+  Both: session check on start -> GET /me (section 13).
+
+--------------------------------------------------------------------------------
+15. ERROR HANDLING
+--------------------------------------------------------------------------------
+Backend files: app/core/exceptions.py, app/main.py (envelope doc)
+
+15.1 The one envelope (parse this ONLY):
+    HTTP <status>  { "error": { "code": "OTP_INVALID",
+                                "message": "That code is not correct.",
+                                "details": { "remaining_attempts": 3 },
+                                "request_id": "0f9c1e4a2b" } }
+    - request_id also arrives as the X-Request-ID header (log it with
+      errors).
+    - 422 body: code "VALIDATION_ERROR", details.fields:
+      [ { "field": "full_name", "reason": "..." } ] - map field -> form field.
+
+15.2 Behavior by status/code (FE-wide, using the existing error patterns):
+    400       -> business rule failed: branch on code (OTP_INVALID,
+                INVALID_MASTER_COMBINATION, CANNOT_REVIEW_OWN_VEHICLE,
+                IMAGE_NOT_RECOGNISED, VEHICLE_TYPE_UNKNOWN, ...).
+    401       -> TOKEN_MISSING / TOKEN_INVALID: session bad -> clear, login.
+                TOKEN_EXPIRED: refresh then retry once. TOKEN_REUSED: force
+                re-login (family revoked).
+    403       -> ROLE_REQUIRED (details.required_role): the account lacks the
+                role - offer to log in with that role (roles accumulate);
+                ACCOUNT_SUSPENDED: message, no retry.
+    404       -> NOT_FOUND / VEHICLE_NOT_FOUND / NOTIFICATION_NOT_FOUND:
+                resource gone (refresh lists) or not owned (never reveal).
+    409       -> CONFLICT / REGISTRATION_ALREADY_LISTED /
+                REVIEW_ALREADY_EXISTS: state conflict -> message on field.
+    422       -> VALIDATION_ERROR: per-field messages from details.fields.
+    429       -> RATE_LIMITED (reserved; rate limiting lands with the OTP
+                throttle): wait-and-retry message.
+    500       -> INTERNAL_ERROR: generic "Something went wrong"; include
+                request_id in any support report.
+    503       -> SERVICE_UNAVAILABLE / OTP_SEND_FAILED /
+                PROVIDER_NOT_CONTACTABLE / CLOUDINARY_NOT_CONFIGURED: retry
+                affordance (safe), except PROVIDER_NOT_CONTACTABLE.
+    Network unavailable / timeout / invalid JSON: generic retry state with
+    the same payload; never silently drop.
+
+--------------------------------------------------------------------------------
+16. LOADING / EMPTY / ERROR STATES (PER SCREEN)
+--------------------------------------------------------------------------------
+Pattern per API-backed screen (use the app's existing state widgets):
+  - Loading  : spinner in the triggering control; disable duplicate submits
+               (buttons disabled while in flight; one in-flight request per
+               mutation).
+  - Success  : render; update local state/cache per section 17.
+  - Empty    : friendly empty state - feed (no listings near you),
+               favourites (none yet), reviews (no reviews yet),
+               notifications (all caught up), my vehicles (start by adding
+               one).
+  - Error    : mapped message + Retry (except where retry is pointless:
+               ACCOUNT_SUSPENDED, PROVIDER_NOT_CONTACTABLE).
+  - Retry    : re-issue the SAME request (same payload, same query).
+
+--------------------------------------------------------------------------------
+17. CACHING / REFRESH
+--------------------------------------------------------------------------------
+Use ONLY what the project already does. Requirements:
+  - Cached: session tokens (session store); UserOut from GET /me (updated
+    locally after PATCH /me); master data tree (section 2.1, refetched on
+    stale-id errors or pull-to-refresh).
+  - Fetched on screen appearance: public feed, vehicle detail, my vehicles,
+    favourites, reviews, notifications, provider summary.
+  - Pull-to-refresh: all list screens (feed, my vehicles, favourites,
+    reviews, notifications, provider home).
+  - Invalidation: after create/edit/delete/availability of a vehicle -> the
+    My Vehicles list (update from the mutation response or refetch); provider
+    summary refetch after those mutations; vehicle detail refetch after a
+    review is posted (rating/review_count change); favourites list removal
+    after unfavourite.
+  - Mutations update the UI from the response where the project already does
+    so; do not introduce a new cache layer.
+--------------------------------------------------------------------------------
+18. MODELS (FRONTEND)
+--------------------------------------------------------------------------------
+[LOCATION] the FE models directory. The FE must have a model (with the exact
+field names below) for each backend shape in this spec; reuse existing
+classes, create missing ones in the project's style:
+  - User            : id, phone, full_name, email, address, roles,
+                      active_role, profile_complete, onboarding
+                      {profile_completed, needs_profile_completion}
+                                                                  (UserOut)
+  - Role            : "USER" | "PROVIDER" (enum-like; both can coexist on
+                      one account)
+  - AuthSession     : access_token, refresh_token, token_type, expires_in,
+                      refresh_expires_in                          (TokenPairOut)
+  - Vehicle (owner) : VehicleOut (full: registration_number, rc_number,
+                      rc_document_public_id, rc_document_url, engine_number,
+                      chassis_number, listing_status, is_available, prices,
+                      images, master ids, created_at, updated_at)
+  - VehicleCard     : VehicleCardOut (public: no registration/phone; plus
+                      provider_id, provider_name, rating, review_count,
+                      distance_km)
+  - VehicleImage    : public_id, url, thumb_url
+  - VehicleType     : id, code, name_en, name_ta
+  - VehicleMasters  : manufacturers [{id, name, models [{id, name,
+                      vehicle_type_code, fuel_type, power_hp, variants
+                      [{id, name, manufacture_year, power_hp}]}]}]
+  - ProviderSummary : total_vehicles, available_vehicles,
+                      unavailable_vehicles, favourite_count,
+                      contact_call_count, review_count, average_rating
+  - Review          : id, vehicle_id, reviewer_id, reviewer_name, rating,
+                      comment, created_at
+  - Favourite       : id, vehicle (VehicleCard), created_at
+  - Notification    : id, type, title, body, data, is_read, read_at,
+                      created_at
+  - Profile         : full_name, email, address, latitude, longitude
+                      (ProfileOut)
+  - ContactCall     : call_id, provider_id, provider_name, provider_phone,
+                      vehicle_id, created_at, message
+  - UploadSignature : cloud_name, api_key, timestamp, signature, folder,
+                      public_id, upload_preset, expires_in
+  - Page<T>         : items, total, limit, offset (except notifications /
+                      favourites - see sections 9 / 7)
+  - Enums           : PriceUnit HOUR|DAY|ACRE|TRIP; FuelType
+                      DIESEL|PETROL|ELECTRIC|CNG; Transmission
+                      MANUAL|AUTOMATIC; ListingStatus DRAFT|PENDING_REVIEW|
+                      APPROVED|REJECTED|SUSPENDED
+
+--------------------------------------------------------------------------------
+19. API-TO-SCREEN MAPPING
+--------------------------------------------------------------------------------
+For every row, fill in the REAL names in the Flutter project:
+  API                              -> [Repository/Service] -> [ViewModel/
+                                      Store] -> [Screen] -> UI behavior
+  POST /auth/otp/request           -> [LOCATION auth service] -> [auth store]
+                                      -> Phone -> masked phone, countdown
+  POST /auth/otp/verify            -> [LOCATION] -> [auth store] -> OTP ->
+                                      store tokens; GET /me; route by
+                                      onboarding
+  POST /auth/refresh               -> [LOCATION api client interceptor] ->
+                                      silent retry
+  POST /auth/logout                -> [LOCATION] -> [auth store] -> clear;
+                                      Role Selection
+  GET /auth/me, GET /me            -> [LOCATION] -> [auth/user store] ->
+                                      start route + role decisions
+  PATCH /me                        -> [LOCATION profile service] ->
+                                      [profile store] -> Add Profile /
+                                      Settings -> update cached user; next
+                                      route by onboarding
+  GET /vehicle-masters             -> [LOCATION masters service] ->
+                                      [add-vehicle store] -> Add Vehicle
+                                      dropdowns (cascade, section 2)
+  GET /vehicle-types               -> same store -> type picker
+  POST /provider/vehicles          -> [LOCATION vehicles service] ->
+                                      [vehicles store] -> Add Vehicle ->
+                                      insert into My Vehicles; detail
+  GET /provider/vehicles           -> same -> My Vehicles (paged, refresh)
+  GET /provider/vehicles/{id}      -> same -> Vehicle Detail (owner) /
+                                      Edit prefill
+  PATCH /provider/vehicles/{id}    -> same -> Edit Vehicle -> update row
+  PATCH .../availability           -> same -> toggle switch -> update row
+  DELETE .../{id}                  -> same -> confirm -> remove row
+  GET /vehicles                    -> [LOCATION feed service] -> [feed store]
+                                      -> Home feed (scroll, refresh)
+  GET /vehicles/{id}               -> same -> Vehicle Detail (public)
+  POST /provider/uploads/signature + Cloudinary direct upload
+                                   -> [LOCATION upload service] -> Add/Edit
+                                      Vehicle photo section -> progress per
+                                      image
+  POST /contact/call               -> [LOCATION contact service] -> Vehicle
+                                      Detail -> dialer with provider_phone
+  POST /vehicles/{id}/favourite, GET /favourites
+                                   -> [LOCATION favourites service] ->
+                                      [favourites store] -> Card/Detail
+                                      heart; Favourites screen
+  GET/POST /vehicles/{id}/reviews  -> [LOCATION reviews service] ->
+                                      [reviews store] -> Detail reviews
+                                      section; Write review
+  GET /notifications, PATCH .../read, PATCH .../read-all
+                                   -> [LOCATION notifications service] ->
+                                      Notifications screen; unread handling
+  GET /provider/summary            -> [LOCATION provider service] ->
+                                      Provider Home dashboard tiles
+
+--------------------------------------------------------------------------------
+20. IMPLEMENTATION RULES FOR THE IMPLEMENTING AGENT (MANDATORY)
+--------------------------------------------------------------------------------
+R1.  Reuse the existing architecture (networking, state, navigation) - find
+     each [LOCATION] and extend, never duplicate.
+R2.  Do NOT create duplicate networking layers (one API client; one
+     interceptor for auth).
+R3.  Do NOT create duplicate API models - extend/reuse the existing ones;
+     new models only where a backend shape has none.
+R4.  Do NOT create duplicate authentication state - one session store, one
+     auth state holder.
+R5.  Do NOT invent backend endpoints, request fields, response fields, or
+     error codes. Anything not in this spec (or /openapi.json) does not
+     exist. Bodies are extra="forbid" - unknown fields fail.
+R6.  Match the actual request/response schemas exactly (field names, enums,
+     paise pricing, public_id-not-URL for images).
+R7.  Preserve role behavior: one phone = one account; roles accumulate;
+     active_role per session; role chosen before the phone screen and never
+     re-asked; role change at verify is a 422.
+R8.  Keep USER and PROVIDER as roles on one account; switching roles never
+     creates another account.
+R9.  Keep booking functionality REMOVED - there is no booking flow; contact
+     is the /contact/call direct call only.
+R10. Use direct Cloudinary upload for images (signature + direct multipart);
+     image bytes never pass through the backend.
+R11. Keep provider vehicle ownership enforced server-side; the FE must never
+     fake ownership or expose owner-only fields publicly.
+R12. Use the existing navigation/coordinator architecture; insert the auth
+     and profile gates into it.
+R13. Fix every error you introduce before finishing (run the project's
+     analyzer/tests; fix new failures).
+R14. Do not modify unrelated features.
+
+--------------------------------------------------------------------------------
+21. ACCEPTANCE CRITERIA (END-TO-END SCENARIOS)
+--------------------------------------------------------------------------------
+A.  NEW USER: Role Selection (USER) -> Phone -> OTP -> verify -> tokens
+    stored -> GET /me (roles [USER], needs_profile_completion true) -> Add
+    Profile -> PATCH /me -> Home feed. The verify request body contains ONLY
+    {phone, code}.
+B.  NEW PROVIDER: same with PROVIDER -> Provider Home (summary zeros) ->
+    Add Vehicle flow (masters cascade) -> vehicle appears in My Vehicles and
+    (when available) on the public feed.
+C.  EXISTING USER -> PROVIDER: same phone, role PROVIDER at request ->
+    verify -> roles [USER, PROVIDER], active_role PROVIDER, profile stays
+    complete, NO second account, lands on Provider Home.
+D.  EXISTING PROVIDER -> USER: mirrored; lands on the USER Home feed.
+E.  USER + PROVIDER account: roles contains both; each login uses the chosen
+    active_role; nothing is lost between the two experiences.
+F.  PROFILE INCOMPLETE: any of full_name/email/address missing -> the Add
+    Profile gate shows on every start until completed.
+G.  PROFILE COMPLETE: app start goes straight to the role home.
+H.  ADD VEHICLE: masters cascade (manufacturer -> models -> variants) with
+    dependent resets; submit with image_public_ids from the upload flow;
+    VehicleOut returned and shown.
+I.  EDIT VEHICLE: prefilled from GET /provider/vehicles/{id}; PATCH updates
+    the row; registration can be changed to an unused plate; images
+    replaceable.
+J.  DELETE VEHICLE: confirmation -> 204 -> removed from the list.
+K.  AVAILABILITY TOGGLE: switch flips is_available; the vehicle disappears
+    from /vehicles when false and returns when true.
+L.  PUBLIC VEHICLE BROWSING: anonymous; feed pages via offset; sort/filter
+    query params sent correctly; thumb_url used in lists.
+M.  VEHICLE DETAIL: public view shows NO registration/phone/rc; Call and
+    review actions require auth.
+N.  IMAGE UPLOAD: signature -> direct Cloudinary multipart -> public_id
+    submitted in the vehicle body; no bytes through the backend.
+O.  FAVOURITE: heart toggles via POST .../favourite (optimistic with
+    rollback on failure); Favourites screen lists and unfavourites locally.
+P.  REVIEW: USER posts rating+comment -> 201 -> list refresh -> detail
+    rating/review_count updated; second review blocked by 409.
+Q.  CALL PROVIDER: POST /contact/call returns provider_phone; dialer opens;
+    provider gets a CALL_INITIATED notification; unavailable vehicle -> 404.
+R.  NOTIFICATIONS: list, unread badge, tap-to-read (PATCH .../read), mark all
+    read; empty state when none.
+S.  PROVIDER DASHBOARD: GET /provider/summary renders the seven fields;
+    counts change after adding a vehicle / a favourite / a call / a review.
+T.  TOKEN EXPIRATION/REFRESH: any 401 TOKEN_EXPIRED -> serialized refresh ->
+    retry once; refresh failure clears the session to Role Selection.
+U.  NETWORK FAILURE: every screen shows loading/error/retry; no double
+    submits; retries re-issue the same request.
+
+--------------------------------------------------------------------------------
+22. ACTUAL PROJECT REFERENCES (BACKEND - ALL VERIFIED TO EXIST)
+--------------------------------------------------------------------------------
+Backend source of truth (read-only for the implementing agent):
+  - app/api/v1/router.py                    (complete API mount table)
+  - app/api/health.py                       (/health, /ready)
+  - app/main.py                             (GET /, error envelope docs)
+  - app/core/exceptions.py                  (AppError types + envelope)
+  - app/core/config.py                      (defaults; api_v1_prefix line 74)
+  - app/core/phone.py                       (normalise_phone, mask_phone)
+  - app/modules/auth/schemas.py             (OtpRequestIn/Out, OtpVerifyIn,
+                                             UserOut, OnboardingOut, LoginOut,
+                                             TokenPairOut, RefreshIn, LogoutIn)
+  - app/modules/auth/service.py             (request_otp, verify_otp,
+                                             refresh_session, logout)
+  - app/modules/auth/router.py              (auth endpoints incl. GET /me)
+  - app/modules/auth/dependencies.py        (get_current_user, require_role,
+                                             get_active_role)
+  - app/modules/auth/repository.py          (session store server-side)
+  - app/modules/profile/router.py           (GET /me, PATCH /me;
+                                             ProfileUpdateIn, ProfileOut)
+  - app/modules/vehicles/schemas.py         (VehicleCreateIn, VehicleUpdateIn,
+                                             VehicleOut, VehicleCardOut,
+                                             VehicleTypeOut, VehiclePage,
+                                             VehicleCardPage)
+  - app/modules/vehicles/service.py         (create/update/delete/availability
+                                             + ownership checks)
+  - app/modules/vehicles/router.py          (provider + public + /vehicle-types)
+  - app/modules/vehicles/models.py          (enums: FuelType, Transmission,
+                                             PriceUnit, ListingStatus;
+                                             MAX_IMAGES = 6)
+  - app/modules/vehicles/registration.py    (plate normalisation)
+  - app/modules/masters/schemas.py          (VehicleMastersOut, ...)
+  - app/modules/masters/service.py          (resolve_references rules +
+                                             error codes)
+  - app/modules/masters/router.py           (GET /vehicle-masters)
+  - app/modules/contact/schemas.py          (ContactCallIn/Out)
+  - app/modules/contact/service.py          (initiate_call + notification)
+  - app/modules/contact/router.py           (POST /contact/call)
+  - app/modules/uploads/schemas.py          (UploadSignatureOut)
+  - app/modules/uploads/service.py          (authorise_upload)
+  - app/modules/uploads/router.py           (POST /provider/uploads/signature)
+  - app/integrations/cloudinary.py          (sign_upload, build_url,
+                                             SIGNATURE_TTL_SECONDS = 3600,
+                                             THUMB_WIDTH = 400)
+  - app/modules/favourites/router.py        (toggle + list)
+  - app/modules/favourites/service.py       (toggle semantics)
+  - app/modules/reviews/schemas.py          (ReviewCreateIn, ReviewOut,
+                                             ReviewPage)
+  - app/modules/reviews/service.py          (create/list rules + codes)
+  - app/modules/reviews/router.py           (list + create)
+  - app/modules/notifications/schemas.py    (NotificationOut, NotificationPage)
+  - app/modules/notifications/router.py     (list, mark_read, read-all)
+  - app/modules/notifications/models.py     (NotificationType: CALL_INITIATED,
+                                             NEW_REVIEW)
+  - app/modules/provider/router.py          (GET /provider/summary +
+                                             ProviderSummaryOut)
+  - app/modules/users/models.py             (UserRole: USER/PROVIDER,
+                                             one-phone uniqueness)
+  - tests/test_auth.py, tests/test_profile.py, tests/test_vehicles.py,
+    tests/test_uploads.py                   (server-side scenario tests the FE
+                                             acceptance criteria mirror)
+Frontend: every FE file reference is a [LOCATION] (section 0.2) - map them in
+the Flutter project; do not invent names.
+
+================================================================================
+END OF PART 1
+================================================================================
+
+
+================================================================================
+PART 2 - AUTH & PROFILE ONBOARDING FLOW SPEC
+(Frontend implementation detail for the auth + Add Profile flow described in Part 1,
+section 1. Merged into this single file on 2026-08-21.)
+================================================================================
+
+================================================================================
+AGRI FE — AUTH & PROFILE ONBOARDING FLOW — IMPLEMENTATION SPEC
+================================================================================
+Version      : 1.0
+Date         : 2026-08-21
+Scope        : Frontend (Flutter) auth screens + profile-completion flow.
+Audience     : One implementation-focused agent (Codex). Read this file plus
+               the project, implement the complete feature.
+Do not touch : Any backend file. The backend behind every contract in this
+               spec is DONE, tested, and merged. This is FE work only.
+================================================================================
+
+--------------------------------------------------------------------------------
+1. PURPOSE
+--------------------------------------------------------------------------------
+The app currently authenticates and (for providers) collects a name at
+verification time. This feature replaces that with the final agreed flow:
+
+    ROLE SELECTION -> PHONE -> OTP -> (tokens stored) -> PROFILE-IF-NEEDED
+    -> role-appropriate home screen
+
+after which profile data is owned by PATCH /me and the onboarding state is
+owned by GET /me. The backend implements exactly this contract; the FE work is
+to (a) add role selection, (b) remove profile fields from the OTP/verify
+screens, (c) persist the returned token pair in the existing session store,
+(d) add a Profile screen driven by GET /me onboarding state, and (e) implement
+refresh + error handling. Nothing below invents API surface: every path, field,
+error code and rule is quoted from the running backend.
+
+--------------------------------------------------------------------------------
+2. SOURCE OF TRUTH & WORKSPACE DISCOVERY (IMPORTANT)
+--------------------------------------------------------------------------------
+2.1 Backend is authoritative
+    The API contracts in section 7 were verified against the actual backend
+    implementation AND its generated OpenAPI document
+    (http://localhost:8000/openapi.json — dump it and diff if in doubt):
+      - app/modules/auth/schemas.py        (request/response models)
+      - app/modules/auth/service.py        (business rules)
+      - app/modules/auth/router.py         (endpoints)
+      - app/modules/profile/router.py      (GET /me, PATCH /me)
+    If this spec and the backend ever disagree, the BACKEND wins.
+
+2.2 Frontend project was NOT found in this workspace
+    This repository (BE-Agri) is backend-only. docs/PROJECT.md (line 11)
+    confirms the mobile client is Flutter and is developed by a separate team.
+    D:\softsuave contains no Flutter project; mvp\Agri_Vehicle_Rental_MVP.pdf
+    (the only product artifact here) documents the flow the backend now
+    implements — its Section 5.1 (Entry & Authentication Flow) is the product
+    basis for this spec: role selection first, auth, role-based redirect, and
+    "if required profile information is missing, the application prompts the
+    user to complete it."
+
+    Therefore every FE file reference below is expressed as a LOCATION TO FIND
+    in the Flutter project (section 14). If the Flutter project is not on disk
+    for the implementing agent, the spec still fully defines BEHAVIOR and
+    CONTRACTS; map each LOCATION to the real file and implement.
+
+--------------------------------------------------------------------------------
+3. NAMING CONVENTIONS (DO NOT RENAME)
+--------------------------------------------------------------------------------
+The backend field names below are the contract. The FE must use them verbatim
+in request bodies and read them verbatim from responses:
+
+  full_name      (never "name")
+  address        (never "location")
+  email
+  latitude / longitude
+  phone          (never "phone_number"; masked in responses)
+  role           (values "USER" | "PROVIDER")
+  roles          (list of every role the user holds)
+  active_role    (the role the current session logged in as)
+  profile_complete / onboarding.profile_completed / onboarding.needs_profile_completion
+  is_new_user, name_required (deprecated, always false), otp_sent, expires_in
+  access_token, refresh_token, token_type, expires_in, refresh_expires_in
+
+--------------------------------------------------------------------------------
+4. FEATURE OVERVIEW — WHAT THE FE MUST DO
+--------------------------------------------------------------------------------
+F1. Show a role-selection screen FIRST (User vs Provider). The chosen role is
+    sent with the OTP request and must never be re-asked or silently changed.
+F2. Phone screen: E.164-capable input, any common Indian format accepted by the
+    backend (9876543210 / 09876543210 / +919876543210 / 91 98765 43210).
+F3. OTP screen: 4-digit code, resend, expiry countdown, attempts feedback.
+F4. Verify with phone + code ONLY (no name, email, address, location fields).
+F5. Persist access_token + refresh_token in the existing session/token store.
+F6. On app start (and after login), call GET /me once and cache the result.
+    It is the source of truth for roles, active role, and onboarding state.
+F7. If onboarding.needs_profile_completion is true -> show the Profile screen
+    BEFORE the role home screen. The Profile screen collects full_name, email,
+    address (and, if the location service is available, lat/lng) and saves via
+    PATCH /me.
+F8. If onboarding is complete -> go straight to the role home screen
+    (USER: search/discover; PROVIDER: provider dashboard/vehicles).
+F9. Implement token refresh on 401 TOKEN_EXPIRED, then retry once.
+F10. Consistent loading / error / retry UX for every call (section 11).
+
+--------------------------------------------------------------------------------
+5. BACKEND FLOW RULES THE FE MUST RESPECT (QUOTED FROM SERVICE CODE)
+--------------------------------------------------------------------------------
+R1. Role is bound to the OTP at request time
+    service.py line ~178: "The role comes from the OTP record, NOT from this
+    request — so a client cannot request a code as USER and verify as
+    PROVIDER." Sending role (or any unknown field) to /otp/verify is a 422
+    (extra="forbid").
+R2. One phone number = one account
+    verify finds-or-creates the user by phone; creating a user requires no
+    profile fields (full_name=None). Roles accumulate: requesting a role the
+    user does not yet have simply grants it. A phone can be both USER and
+    PROVIDER.
+R3. Profile fields are NEVER collected before or at verification.
+    name_required in the OTP request response is always false and deprecated.
+R4. Codes are single-use, expire (expires_in seconds), and allow
+    OTP_MAX_ATTEMPTS wrong guesses; afterwards the code is burned and a new one
+    must be requested. A wrong code returns 400 OTP_INVALID with
+    details.remaining_attempts.
+R5. Suspended accounts: 403 ACCOUNT_SUSPENDED at request and at verify.
+R6. Profile completion = all three of full_name, email, address present
+    (bool(user.full_name and user.email and user.address)). Not "is a new
+    phone". lat/lng do NOT affect completion.
+R7. PATCH /me semantics: every field optional; send only what changed.
+    null = "leave unchanged", "" = "clear it". full_name/address whitespace is
+    collapsed; email is stripped+lowercased. Phone cannot be changed here.
+
+--------------------------------------------------------------------------------
+6. API CONTRACTS (EXACT — VERIFIED AGAINST BACKEND + OPENAPI)
+--------------------------------------------------------------------------------
+Base URL: http://<host>:8000/api/v1
+Auth header: "Authorization: Bearer <access_token>"
+
+6.1 POST /api/v1/auth/otp/request
+    Request:
+      { "phone": "9876543210", "role": "USER" }        # role required
+    Response 200 (OtpRequestOut):
+      {
+        "phone": "+9198****3210",      # masked, display back to the user
+        "is_new_user": true,
+        "name_required": false,        # deprecated; always false
+        "otp_sent": true,
+        "expires_in": 300
+      }
+    Errors: 422 (invalid phone / no role / unknown role), 403 ACCOUNT_SUSPENDED,
+            503 OTP_SEND_FAILED (safe to retry as-is).
+
+6.2 POST /api/v1/auth/otp/verify
+    Request (ONLY these two fields; extra fields -> 422; schema shows
+    additionalProperties: false, required [phone, code]):
+      { "phone": "9876543210", "code": "0000" }
+    Response 200 (LoginOut):
+      {
+        "is_new_user": true,
+        "access_token": "<jwt>",
+        "refresh_token": "<opaque>",
+        "token_type": "bearer",
+        "expires_in": 900,             # access token TTL (seconds)
+        "refresh_expires_in": 2592000, # refresh token TTL (30 days)
+        "user": {
+          "id": "<uuid>",
+          "phone": "+9198****3210",    # masked even to the owner
+          "full_name": null,
+          "email": null,
+          "address": null,
+          "roles": ["USER"],
+          "active_role": "USER",
+          "profile_complete": false,
+          "onboarding": { "profile_completed": false, "needs_profile_completion": true }
+        }
+      }
+    Errors: 400 OTP_NOT_FOUND (no active code — request a new one),
+            400 OTP_ATTEMPTS_EXCEEDED,
+            400 OTP_INVALID (details.remaining_attempts),
+            403 ACCOUNT_SUSPENDED.
+
+6.3 POST /api/v1/auth/refresh
+    Request: { "refresh_token": "<opaque>" }
+    Response 200: TokenPairOut (access_token, refresh_token, token_type,
+                  expires_in, refresh_expires_in). Old refresh token is
+                  rotated (invalidated).
+    Errors: 401 TOKEN_INVALID, 401 TOKEN_REUSED (chain revoked — force
+            full re-login), 401 TOKEN_EXPIRED.
+
+6.4 POST /api/v1/auth/logout
+    Request: { "refresh_token": "<opaque>", "all_devices": false }
+    Response: 204 always (whether or not the token existed). Access token stays
+              usable for its final minutes by design.
+
+6.5 GET /api/v1/me   (and identical GET /api/v1/auth/me)
+    Response 200: UserOut — same shape as verify's user object (section 6.2).
+    Errors: 401 (missing/invalid/expired token; if code == TOKEN_EXPIRED, try
+            /auth/refresh first).
+
+6.6 PATCH /api/v1/me
+    Request (all optional; extra fields -> 422):
+      { "full_name": "Ravi Kumar", "email": "ravi@example.com",
+        "address": "12 Gandhi St, Sulur", "latitude": 11.05, "longitude": 77.13 }
+    null = leave unchanged; "" = clear; whitespace collapsed on full_name/address;
+    email stripped+lowercased.
+    Response 200 (ProfileOut):
+      { "full_name": "Ravi Kumar", "email": "ravi@example.com",
+        "address": "12 Gandhi St, Sulur", "latitude": 11.05, "longitude": 77.13 }
+    Errors: 401, 422 (e.g. full_name min_length 2, latitude out of range).
+
+--------------------------------------------------------------------------------
+7. USER SCENARIOS (ALL MUST WORK)
+--------------------------------------------------------------------------------
+S1. New user, role USER: role select -> phone -> OTP -> verify (is_new_user
+    true, profile incomplete) -> Profile screen -> PATCH /me -> USER home.
+S2. New provider: same with role PROVIDER -> Profile screen -> PROVIDER home.
+S3. Existing user, profile complete, same role: role select -> phone -> OTP ->
+    verify (is_new_user false, profile_complete true) -> straight to home.
+S4. Existing user, profile incomplete (any of the three fields missing):
+    -> Profile screen -> PATCH /me -> home.
+S5. Same phone, second role (USER then PROVIDER, or vice versa): second verify
+    returns roles [USER, PROVIDER] (both accumulate); active_role is the just-
+    logged-in role; NO duplicate account is created; profile stays complete.
+S6. Session restored at app start: GET /me 200 -> route by active_role +
+    onboarding. 401 TOKEN_EXPIRED -> refresh -> retry GET /me. Refresh fails ->
+    clear session -> role-selection screen.
+S7. Wrong code: 400 OTP_INVALID with remaining_attempts; UI shows attempts left.
+S8. Code expired / consumed / no active code: 400 OTP_NOT_FOUND -> UI offers
+    "Request a new code" (re-uses the same phone + role, same request call).
+S9. SMS gateway failure: 503 OTP_SEND_FAILED -> error state, retry button.
+S10. Suspended account: 403 ACCOUNT_SUSPENDED on request/verify -> message,
+     no retry loop.
+S11. Provider completes profile later (skipped it after login): Profile screen
+     must be reachable from PROVIDER home (profile/settings entry) and saving
+     via the same PATCH /me flips onboarding to complete on the next GET /me.
+S12. Logout: revoke refresh token, clear local session, return to role
+     selection (NOT to a role-specific login).
+
+--------------------------------------------------------------------------------
+8. SCREEN SPECIFICATIONS (FLOW ORDER)
+--------------------------------------------------------------------------------
+8.1 Role Selection (first screen of the auth flow; also the "signed out" home)
+    - Two large choice cards: "I need a vehicle" (USER) and "I own / drive a
+      vehicle" (PROVIDER). Selecting proceeds to the phone screen carrying
+      role = USER | PROVIDER.
+    - MUST NOT be reachable mid-flow again; back from phone/OTP returns to it.
+8.2 Phone
+    - Text field (tel keyboard), accepts 9876543210 / 09876543210 /
+      +919876543210 / 91 98765 43210. Submit as typed — backend normalises.
+    - "Continue" disabled until input is non-empty; client-side format check
+      is cosmetic only (backend enforces real validation; 422 shows its message).
+    - Calls POST /auth/otp/request with { phone, role }.
+    - On 200: show masked phone from response ("+9198****3210") with a
+      "Change" action back to the phone screen; go to OTP screen.
+    - is_new_user and name_required are NOT shown to the user and change no
+      UI (name_required is always false).
+8.3 OTP
+    - 4-digit entry, auto-advance. Shows masked phone + resend timer
+      (counts down expires_in seconds).
+    - Calls POST /auth/otp/verify with { phone, code } ONLY.
+    - "Resend" = repeat the 6.1 request with the SAME phone and SAME role.
+    - On 400 OTP_INVALID: show "That code is not correct. X attempts left."
+    - On 400 OTP_NOT_FOUND: show "Code expired — request a new one" and resend.
+    - On success: persist the token pair (8.4) -> GET /me (8.5).
+8.4 Token storage
+    - LOCATION (find in Flutter project): the existing session/token store used
+      by the current auth implementation. Persist access_token, refresh_token,
+      expires_in, refresh_expires_in. Keep using this store — do NOT add a
+      second token system.
+8.5 Session check after login AND at app start
+    - Call GET /me once. Cache UserOut locally (it changes only via PATCH /me).
+    - active_role determines the home screen; roles (full list) may drive a
+      role switch later — keep it in state.
+8.6 Profile (Add Profile / Complete your profile)
+    - Shown when onboarding.needs_profile_completion == true (or profile_complete
+      == false). Fields: full_name (required, min 2 chars), email (required,
+      validated), address (required, free text). Optional: latitude/longitude
+      from the existing location service (section 10) when available.
+    - "Save" calls PATCH /me with all entered fields. On 200, update cached
+      user state, re-check completion locally, navigate to the role home.
+    - The Profile screen must ALSO be reachable later (profile/settings entry)
+      to fix incomplete data or edit details.
+8.7 Role home screens (unchanged by this feature — just the redirect targets)
+
+--------------------------------------------------------------------------------
+9. NAVIGATION REQUIREMENTS
+--------------------------------------------------------------------------------
+- Auth stack: RoleSelection -> Phone -> OTP -> (Profile if needed) -> home.
+- Back/Android hardware back within auth: OTP -> Phone -> RoleSelection.
+- After tokens exist, Profile -> home must be a forward navigation (back from
+  home must NOT return to OTP).
+- Signed-out state is determined by the session store (no tokens or refresh
+  failed): land on RoleSelection, never on a specific role's login.
+- LOCATION (find in Flutter project): app router/navigator and the coordinator
+  that decides the start route after restore — map sections 8.5-8.6 into it.
+
+--------------------------------------------------------------------------------
+10. LOCATION HANDLING
+--------------------------------------------------------------------------------
+- The MVP PDF (Section 5.2) says users "grant location permission or select a
+  location manually". Backend contract: PATCH /me accepts latitude (ge -90..90)
+  and longitude (ge -180..180); there is NO geocoding endpoint — the FE sends
+  raw coordinates (docs/PROJECT.md A10).
+- On the Profile screen: use the Flutter project's existing location/permission
+  service (LOCATION — find it). If permission granted, attach the current
+  coordinates to PATCH /me. If denied or unavailable, allow the profile to be
+  saved without coordinates (they do not affect profile completion) and offer
+  a manual/retry affordance. Never block the flow on location.
+
+--------------------------------------------------------------------------------
+11. LOADING / ERROR / RETRY UX
+--------------------------------------------------------------------------------
+- Every API call: disable the triggering action while in flight (spinner in
+  the button), never leave a screen accepting duplicate submits.
+- Map backend errors to messages:
+    422            -> show the backend detail message(s) inline on the field
+    400 OTP_INVALID -> attempts remaining
+    400 OTP_NOT_FOUND / OTP_ATTEMPTS_EXCEEDED -> "request a new code"
+    400 OTP_SEND_FAILED / 503 -> retry screen/button
+    401 TOKEN_EXPIRED -> transparent refresh + retry (section 12)
+    401 TOKEN_REUSED / TOKEN_INVALID -> clear session, role selection
+    403 ACCOUNT_SUSPENDED -> message; no retry
+    network/timeout  -> generic retry with the same payload
+- Resend/verify must never double-fire: guard by state.
+
+--------------------------------------------------------------------------------
+12. TOKEN REFRESH BEHAVIOR
+--------------------------------------------------------------------------------
+- On any 401 with code TOKEN_EXPIRED: POST /auth/refresh with the stored
+  refresh token, atomically replace BOTH stored tokens with the response pair
+  (rotation), then retry the original request ONCE.
+- On 401 TOKEN_REUSED or TOKEN_INVALID, or refresh network failure: clear the
+  session and route to RoleSelection.
+- Refresh must be serialized: one in-flight refresh shared by concurrent
+  requests (queue-and-share pattern), so 401 storms don't create parallel
+  refreshes.
+- LOCATION (find in Flutter project): the API client / interceptor where
+  Authorization headers are attached — hook refresh there.
+
+--------------------------------------------------------------------------------
+13. STATE REQUIREMENTS
+--------------------------------------------------------------------------------
+- Single source of truth for the session: the existing session store (tokens).
+- Single source of truth for the user: the last GET /me response, updated
+  after PATCH /me (locally mirror the change; do not re-fetch on every screen).
+- Auth flow state: role (chosen once), phone (entered once) — both carried
+  through the auth stack; role is immutable after RoleSelection.
+- Auth state enum: signedOut | requestingOtp | verifying | authenticated.
+  Loading per-screen as in section 11.
+
+--------------------------------------------------------------------------------
+14. FILE REFERENCES / DISCOVERY CHECKLIST (FE)
+--------------------------------------------------------------------------------
+The Flutter project is a separate codebase (docs/PROJECT.md:11) and was not
+present in this workspace, so locate each of these in the Flutter repo and
+reuse the real files (do not create parallel infrastructure):
+  [LOCATION] session/token storage service        -> section 8.4
+  [LOCATION] app router/navigator + start-route coordinator -> sections 8.5, 9
+  [LOCATION] API client / auth header interceptor  -> section 12
+  [LOCATION] existing login/OTP screens            -> sections 8.2, 8.3 (extend)
+  [LOCATION] existing location/permission service  -> section 10
+  [LOCATION] profile/settings screen entry point   -> sections 8.6, S11
+If any of these does not exist, the agent must report the gap instead of
+silently inventing an architecture.
+Backend ground truth (already in this repo — read, never modify):
+  app/modules/auth/schemas.py     app/modules/auth/service.py
+  app/modules/auth/router.py      app/modules/profile/router.py
+  tests/test_auth.py              tests/test_profile.py   (scenario tests)
+
+--------------------------------------------------------------------------------
+15. MUST NOTS
+--------------------------------------------------------------------------------
+M1. NO profile fields at /otp/verify — phone and code only. Removing the name
+    field from the verify screen is the point of this feature.
+M2. NO new backend endpoints; NO backend edits at all.
+M3. NO second token/session system; reuse the existing store.
+M4. NO hard-coding profile completion (e.g. "new phone => needs profile").
+    GET /me decides; the only local rule is the same three-field check.
+M5. NO discarding roles: keep roles (list) and active_role from UserOut; a
+    login with a second role must not log the first one out or replace it.
+M6. NO role re-selection inside phone/OTP screens; the role chosen first is
+    the role sent at request and is bound by the backend at verify (R1).
+M7. NO new field names: use the exact names in section 3.
+M8. NO duplicate accounts: one phone number is one account (R2); the FE never
+    creates anything itself.
+M9. DO NOT show masked phone formatting errors: the backend returns the masked
+    number; display it as given.
+M10. DO NOT auto-submit the code or auto-login silently — keep explicit user
+     action per screen (a11y + accidental-login guard).
+
+--------------------------------------------------------------------------------
+16. ACCEPTANCE CRITERIA (each maps to a backend test you can read)
+--------------------------------------------------------------------------------
+A1. Role chosen first, sent with OTP request, never re-asked.
+A2. Verify request body contains exactly { phone, code } (extra fields -> 422).
+A3. Tokens persisted in the existing store; user lands on Profile when
+    onboarding.needs_profile_completion == true, else on the role home.
+A4. Profile save uses PATCH /me; after a successful save the next GET /me
+    shows onboarding.profile_completed == true when all 3 fields are set.
+A5. Same phone logging in with a second role lands in that role's experience,
+    keeps both roles, no duplicate user.
+A6. App start with stored tokens: GET /me -> correct route; 401 TOKEN_EXPIRED
+    -> silent refresh + retry; refresh failure -> role selection.
+A7. Wrong code shows remaining attempts; expired code offers resend with the
+    same phone+role; SMS failure shows retry.
+A8. Logout revokes the refresh token and returns to RoleSelection.
+A9. No profile fields anywhere in the OTP/verify screens (verify screen shows
+    only phone + code input).
+A10. Provider can reach the Profile screen from their home and complete it
+     later (S11).
+Cross-check against backend tests: tests/test_profile.py and tests/test_auth.py
+cover the server side of every criterion above.
+
+--------------------------------------------------------------------------------
+17. RECOMMENDED IMPLEMENTATION ORDER
+--------------------------------------------------------------------------------
+1.  Map the LOCATIONs in section 14 (session store, router, API client,
+    location service). Report gaps.
+2.  Verify endpoint: strip profile fields from the OTP/verify screens; send
+    { phone, code } only; wire LoginOut token pair into the session store.
+3.  Role selection screen; carry role through phone/OTP; pass it in the
+    6.1 request.
+4.  Start-route coordinator: on app start, tokens present -> GET /me ->
+    Profile-or-home by onboarding; tokens absent -> RoleSelection.
+5.  Profile screen + PATCH /me (with location attach when available);
+    post-save state update; profile/settings entry from home.
+6.  Refresh-on-401 interceptor (serialized) + error mapping table (section 11).
+7.  Logout (6.4) + session clear -> RoleSelection.
+8.  Walk every scenario in section 7; check MUST NOTs in section 15.
+
+--------------------------------------------------------------------------------
+18. WHAT TO VERIFY BEFORE DECLARING DONE
+--------------------------------------------------------------------------------
+- Diff the written code against sections 3, 6, 7, 15 one by one.
+- Backend untouched (git status shows no app/ changes from this work).
+- Manual walkthrough of S1-S12 with the dev backend
+  (local OTP is printed in the server terminal; OTP_DEV_BYPASS_CODE=0000
+  works for any number).
+- The verify request actually contains only phone+code (network inspector).
+================================================================================
+END OF SPEC
+================================================================================
+================================================================================
+END OF COMBINED SPEC (PART 1 + PART 2)
+================================================================================
+
+

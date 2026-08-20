@@ -13,9 +13,9 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from mangum import Mangum
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from mangum import Mangum
 
 from app.api.health import router as health_router
 from app.api.v1.router import api_router
@@ -94,7 +94,7 @@ Backend API for the Agri-Vehicle Rental app.
 Two steps. The phone number is the identity; there are no passwords.
 
 1. `POST /auth/otp/request` — send the phone number **and a role**
-   (`RENTER` or `PROVIDER`). The response says whether the number is new and
+   (`USER` or `PROVIDER`). The response says whether the number is new and
    whether you must collect a name.
 2. `POST /auth/otp/verify` — send the phone number, the {settings.otp_length}-digit code, and the
    name if it was asked for. You get back a user and two tokens.

@@ -81,6 +81,8 @@ mobile API contract:
 | POST | `/api/v1/auth/refresh` | New token pair; rotates the refresh token |
 | POST | `/api/v1/auth/logout` | Revoke this session, or all of them |
 | GET | `/api/v1/auth/me` | Session check on app start |
+| GET | `/api/v1/me` | Session check (shorter path the app uses) |
+| PATCH | `/api/v1/me` | Edit profile: name, email, address, location |
 
 **Vehicle listings** — `/provider/*` needs the PROVIDER role and only ever
 touches the caller's own vehicles; the rest is public and needs no token:
@@ -88,22 +90,43 @@ touches the caller's own vehicles; the rest is public and needs no token:
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/api/v1/vehicle-types` | The seeded type taxonomy |
-| GET | `/api/v1/vehicles` | Public feed, paginated, filterable by type |
+| GET | `/api/v1/vehicle-masters` | Manufacturer → model → variant cascade (dropdowns), filterable by `type_code` |
+| GET | `/api/v1/vehicles` | Public feed, paginated, filterable by type / radius, sortable by distance |
 | GET | `/api/v1/vehicles/{id}` | Public listing detail |
 | POST | `/api/v1/provider/uploads/signature` | Authorise a direct Cloudinary upload |
-| POST | `/api/v1/provider/vehicles` | Add a listing |
+| POST | `/api/v1/provider/vehicles` | Add a listing (master refs optional) |
 | GET | `/api/v1/provider/vehicles` | My listings |
 | GET | `/api/v1/provider/vehicles/{id}` | One of mine, for the edit screen |
 | PATCH | `/api/v1/provider/vehicles/{id}` | Edit (partial) |
 | PATCH | `/api/v1/provider/vehicles/{id}/availability` | On/off the public feed |
 | DELETE | `/api/v1/provider/vehicles/{id}` | Soft delete |
 
-No public response ever contains a provider's phone number or a vehicle's
-registration number. Contact goes through masked calling (Phase 7).
+**Engagement** — all need a token:
 
-Profiles, verification, admin, radius search and calling are still to come — see
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/api/v1/contact/call` | Record a call to a vehicle's provider; returns the provider's number to dial |
+| POST | `/api/v1/vehicles/{id}/favourite` | Add to favourites |
+| DELETE | `/api/v1/vehicles/{id}/favourite` | Remove from favourites |
+| GET | `/api/v1/favourites` | My favourites |
+| GET | `/api/v1/vehicles/{id}/reviews` | A vehicle's reviews (public) |
+| POST | `/api/v1/vehicles/{id}/reviews` | Write a review |
+| GET | `/api/v1/notifications` | My notifications (read filter, paginated) |
+| PATCH | `/api/v1/notifications/{id}/read` | Mark one read |
+| PATCH | `/api/v1/notifications/read-all` | Mark all read |
+| GET | `/api/v1/provider/summary` | Provider dashboard stats (PROVIDER role) |
+
+No public response ever contains a provider's phone number or a vehicle's
+registration number — they are returned only by `POST /contact/call`, to the
+caller who authenticated and initiated the call.
+
+Master data, admin, verification and radius search are still to come — see
 [`docs/PROJECT.md`](docs/PROJECT.md) §11 for the roadmap and §13 for what is
-blocked on whom.
+blocked on whom. Master data is seeded by script:
+
+```powershell
+uv run python scripts/seed_master_data.py    # idempotent; safe to re-run
+```
 
 ## Environments
 

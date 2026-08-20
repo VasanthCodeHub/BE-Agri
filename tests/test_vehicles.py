@@ -7,9 +7,15 @@ never carry a phone number or a registration number (ADR-009).
 
 from __future__ import annotations
 
+import uuid
 from typing import Any
 
 from httpx import AsyncClient
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.modules.masters.models import VehicleManufacturer, VehicleModel, VehicleVariant
+from app.modules.vehicles.models import FuelType, VehicleType
 
 AUTH = "/api/v1/auth"
 API = "/api/v1"
@@ -38,13 +44,21 @@ def _payload(**overrides: Any) -> dict[str, Any]:
 
 
 async def _token(client: AsyncClient, phone: str, role: str = "PROVIDER") -> str:
-    """Register/log in and return an access token for the given role."""
+    """Register/log in and return an access token for the given role.
+
+    Mirrors the real flow: verify with phone+code only, then complete the
+    profile through PATCH /me (the public feed shows the profile name).
+    """
     await client.post(f"{AUTH}/otp/request", json={"phone": phone, "role": role})
-    response = await client.post(
-        f"{AUTH}/otp/verify", json={"phone": phone, "code": "0000", "name": f"User {phone[-4:]}"}
-    )
+    response = await client.post(f"{AUTH}/otp/verify", json={"phone": phone, "code": "0000"})
     assert response.status_code == 200, response.text
     token: str = response.json()["access_token"]
+    completed = await client.patch(
+        f"{API}/me",
+        json={"full_name": f"User {phone[-4:]}"},
+        headers=_auth(token),
+    )
+    assert completed.status_code == 200, completed.text
     return token
 
 
@@ -103,9 +117,9 @@ async def test_adding_a_vehicle_requires_a_token(client: AsyncClient) -> None:
     assert response.json()["error"]["code"] == "TOKEN_MISSING"
 
 
-async def test_a_renter_cannot_add_a_vehicle(client: AsyncClient) -> None:
-    """Holding only the RENTER role must not reach a provider endpoint."""
-    token = await _token(client, "9810000002", role="RENTER")
+async def test_a_user_cannot_add_a_vehicle(client: AsyncClient) -> None:
+    """Holding only the USER role must not reach a provider endpoint."""
+    token = await _token(client, "9810000002", role="USER")
 
     response = await client.post(f"{API}/provider/vehicles", json=_payload(), headers=_auth(token))
 
@@ -493,21 +507,21 @@ async def test_provider_cannot_fetch_another_providers_vehicle_by_id(client: Asy
 
 async def test_my_vehicle_by_id_requires_the_provider_role(client: AsyncClient) -> None:
     provider = await _token(client, "9810000054")
-    renter = await _token(client, "9810000055", role="RENTER")
+    user = await _token(client, "9810000055", role="USER")
     vehicle = await _create(client, provider, registration_number="TN38GG4444")
 
     anonymous = await client.get(f"{API}/provider/vehicles/{vehicle['id']}")
-    as_renter = await client.get(f"{API}/provider/vehicles/{vehicle['id']}", headers=_auth(renter))
+    as_user = await client.get(f"{API}/provider/vehicles/{vehicle['id']}", headers=_auth(user))
 
     assert anonymous.status_code == 401
-    assert as_renter.status_code == 403
+    assert as_user.status_code == 403
 
 
 # ---------------------------------------------------------------------------
 # Listing detail
 # ---------------------------------------------------------------------------
 async def test_a_single_listing_can_be_fetched_without_a_token(client: AsyncClient) -> None:
-    """The screen a renter lands on after tapping a card."""
+    """The screen a USER lands on after tapping a card."""
     token = await _token(client, "9810000030")
     vehicle = await _create(client, token, registration_number="TN38DD1111")
 
@@ -671,23 +685,35 @@ async def test_omitting_a_coordinate_differs_from_sending_null(client: AsyncClie
     assert cleared.json()["latitude"] is None
 
 
-async def test_editing_cannot_change_the_registration_number(client: AsyncClient) -> None:
-    """A different plate is a different vehicle, so the field is not editable.
-
-    `extra` fields are ignored rather than rejected, so the request succeeds and
-    the number simply does not move.
-    """
-    token = await _token(client, "9810000039")
+async def test_editing_can_change_the_registration_number(client: AsyncClient) -> None:
+    """A provider can fix a mistyped plate on their own listing."""
+    token = await _token(client, "9810000042")
     vehicle = await _create(client, token, registration_number="TN38EE7777")
 
     response = await client.patch(
         f"{API}/provider/vehicles/{vehicle['id']}",
-        json={"registration_number": "TN38EE8888"},
+        json={"registration_number": "TN 38 EE 7778"},
         headers=_auth(token),
     )
 
     assert response.status_code == 200
-    assert response.json()["registration_number"] == "TN38EE7777"
+    assert response.json()["registration_number"] == "TN38EE7778"
+
+
+async def test_editing_cannot_steal_another_vehicles_registration(client: AsyncClient) -> None:
+    """Changing to a plate already held by another live listing is a 409."""
+    token = await _token(client, "9810000043")
+    await _create(client, token, registration_number="TN38EE7777")
+    vehicle = await _create(client, token, registration_number="TN38EE7779")
+
+    response = await client.patch(
+        f"{API}/provider/vehicles/{vehicle['id']}",
+        json={"registration_number": "TN38EE7777"},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "REGISTRATION_ALREADY_LISTED"
 
 
 async def test_a_provider_cannot_edit_another_providers_vehicle(client: AsyncClient) -> None:
@@ -705,15 +731,15 @@ async def test_a_provider_cannot_edit_another_providers_vehicle(client: AsyncCli
     assert response.json()["error"]["code"] == "VEHICLE_NOT_FOUND"
 
 
-async def test_a_renter_cannot_edit_a_vehicle(client: AsyncClient) -> None:
+async def test_a_user_cannot_edit_a_vehicle(client: AsyncClient) -> None:
     provider = await _token(client, "9810000042")
-    renter = await _token(client, "9810000043", role="RENTER")
+    user = await _token(client, "9810000043", role="USER")
     vehicle = await _create(client, provider, registration_number="TN38FF1111")
 
     response = await client.patch(
         f"{API}/provider/vehicles/{vehicle['id']}",
         json={"price_amount": 1},
-        headers=_auth(renter),
+        headers=_auth(user),
     )
 
     assert response.status_code == 403
@@ -750,7 +776,7 @@ async def test_an_empty_patch_changes_nothing(client: AsyncClient) -> None:
 
 
 async def test_an_edit_is_visible_on_the_public_feed(client: AsyncClient) -> None:
-    """End to end: the provider edits, the renter sees it."""
+    """End to end: the provider edits, the USER sees it."""
     token = await _token(client, "9810000046")
     vehicle = await _create(client, token, registration_number="TN38FF4444")
 
@@ -806,3 +832,257 @@ async def test_price_is_stored_in_paise_and_displayed_in_rupees(client: AsyncCli
 
     assert per_acre["price_amount"] == 125050
     assert per_acre["price_label"] == "₹1,250.50 / acre"
+
+
+# ---------------------------------------------------------------------------
+# Master-data path — the Add Vehicle form
+# ---------------------------------------------------------------------------
+async def _seed_master(
+    db_session: AsyncSession, *, active: bool = True
+) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
+    """Create one manufacturer → model → variant chain for the test."""
+    type_id = (
+        await db_session.execute(select(VehicleType.id).where(VehicleType.code == "TRACTOR"))
+    ).scalar_one()
+    manufacturer = VehicleManufacturer(name="Test Motors")
+    db_session.add(manufacturer)
+    await db_session.flush()
+    model = VehicleModel(
+        manufacturer_id=manufacturer.id,
+        name="TX 500",
+        vehicle_type_id=type_id,
+        fuel_type=FuelType.DIESEL,
+        power_hp=50,
+    )
+    db_session.add(model)
+    await db_session.flush()
+    variant = VehicleVariant(model_id=model.id, name="Standard 2019")
+    db_session.add(variant)
+    await db_session.flush()
+    if not active:
+        model.is_active = False
+    return manufacturer.id, model.id, variant.id
+
+
+async def test_creating_with_a_master_model_derives_the_specs(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Pick a model in the form → brand/type/fuel/power come from master data.
+
+    Whatever the client also sent for them is overwritten with the canonical
+    master values (a conflicting vehicle_type_code is rejected — next test).
+    """
+    _, model_id, _ = await _seed_master(db_session)
+    token = await _token(client, "9810000044")
+
+    body = await _create(
+        client,
+        token,
+        registration_number="TN38HH1111",
+        brand="Client says wrong",
+        model="Client says wrong",
+        vehicle_type_code="TRACTOR",
+        fuel_type="PETROL",
+        power_hp=999,
+        model_id=model_id,
+    )
+
+    assert body["brand"] == "Test Motors"
+    assert body["model"] == "TX 500"
+    assert body["vehicle_type"]["code"] == "TRACTOR"
+    assert body["fuel_type"] == "DIESEL"
+    assert body["power_hp"] == 50
+    assert body["manufacturer_id"] is not None
+    assert body["model_id"] == str(model_id)
+
+
+async def test_creating_with_a_master_model_rejects_a_conflicting_type(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The client cannot sneak a different type past a master model."""
+    _, model_id, _ = await _seed_master(db_session)
+    token = await _token(client, "9810000045")
+
+    response = await client.post(
+        f"{API}/provider/vehicles",
+        json=_payload(
+            registration_number="TN38HH2222",
+            vehicle_type_code="HARVESTER",
+            model_id=model_id,
+        ),
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "INVALID_MASTER_COMBINATION"
+
+
+async def test_creating_with_just_a_variant_derives_the_whole_chain(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A variant implies its model, and the model implies the manufacturer."""
+    _, _, variant_id = await _seed_master(db_session)
+    token = await _token(client, "9810000046")
+
+    body = await _create(
+        client,
+        token,
+        registration_number="TN38HH3333",
+        variant_id=variant_id,
+    )
+
+    assert body["brand"] == "Test Motors"
+    assert body["model"] == "TX 500"
+    assert body["vehicle_type"]["code"] == "TRACTOR"
+    assert body["variant_id"] == str(variant_id)
+
+
+async def test_an_unknown_master_model_is_rejected(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    token = await _token(client, "9810000047")
+
+    response = await client.post(
+        f"{API}/provider/vehicles",
+        json=_payload(
+            registration_number="TN38HH4444",
+            model_id=uuid.uuid4(),
+        ),
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "VEHICLE_MODEL_NOT_FOUND"
+
+
+async def test_an_inactive_master_model_is_rejected(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Inactive rows are as good as gone: the picker never offers them."""
+    _, model_id, _ = await _seed_master(db_session, active=False)
+    token = await _token(client, "9810000048")
+
+    response = await client.post(
+        f"{API}/provider/vehicles",
+        json=_payload(
+            registration_number="TN38HH5555",
+            model_id=model_id,
+        ),
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "VEHICLE_MODEL_NOT_FOUND"
+
+
+async def test_a_variant_must_belong_to_the_chosen_model(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, model_id, _ = await _seed_master(db_session)
+    other_type_id = (
+        await db_session.execute(select(VehicleType.id).where(VehicleType.code == "SPRAYER"))
+    ).scalar_one()
+    other_manufacturer = VehicleManufacturer(name="Other Motors")
+    db_session.add(other_manufacturer)
+    await db_session.flush()
+    other_model = VehicleModel(
+        manufacturer_id=other_manufacturer.id,
+        name="Other Model",
+        vehicle_type_id=other_type_id,
+        fuel_type=FuelType.PETROL,
+        power_hp=5,
+    )
+    db_session.add(other_model)
+    await db_session.flush()
+    foreign_variant = VehicleVariant(model_id=other_model.id, name="Foreign")
+    db_session.add(foreign_variant)
+    await db_session.flush()
+    token = await _token(client, "9810000049")
+
+    response = await client.post(
+        f"{API}/provider/vehicles",
+        json=_payload(
+            registration_number="TN38HH6666",
+            model_id=model_id,
+            variant_id=foreign_variant.id,
+        ),
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "INVALID_MASTER_COMBINATION"
+
+
+async def test_the_owner_sees_the_rc_identity_and_the_public_feed_never_does(
+    client: AsyncClient,
+) -> None:
+    """RC book details are the owner's private view of their physical machine."""
+    token = await _token(client, "9810000052")
+    vehicle = await _create(
+        client,
+        token,
+        registration_number="TN38HH7777",
+        rc_number="TN38R1234567890",
+        rc_document_public_id="agri/documents/rc/9f8e7d6c",
+        engine_number="ENG123456789",
+        chassis_number="CHS987654321",
+    )
+
+    mine = await client.get(f"{API}/provider/vehicles/{vehicle['id']}", headers=_auth(token))
+    assert mine.status_code == 200
+    assert mine.json()["rc_number"] == "TN38R1234567890"
+    assert mine.json()["rc_document_public_id"] == "agri/documents/rc/9f8e7d6c"
+    assert "res.cloudinary.com" in mine.json()["rc_document_url"]
+    assert mine.json()["engine_number"] == "ENG123456789"
+    assert mine.json()["chassis_number"] == "CHS987654321"
+
+    feed = (await client.get(f"{API}/vehicles")).json()
+    card = next(c for c in feed["items"] if c["id"] == vehicle["id"])
+    assert "rc_number" not in card
+    assert "rc_document_public_id" not in card
+    assert "rc_document_url" not in card
+    assert "engine_number" not in card
+    assert "chassis_number" not in card
+    assert "TN38R1234567890" not in str(feed)
+
+
+async def test_editing_to_a_master_model_rederives_type_fuel_and_power(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """PATCH with a model_id moves the listing onto the master model's specs."""
+    _, model_id, _ = await _seed_master(db_session)
+    token = await _token(client, "9810000053")
+    vehicle = await _create(
+        client, token, registration_number="TN38HH8888", vehicle_type_code="SPRAYER"
+    )
+
+    response = await client.patch(
+        f"{API}/provider/vehicles/{vehicle['id']}",
+        json={"model_id": str(model_id)},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["vehicle_type"]["code"] == "TRACTOR"
+    assert body["fuel_type"] == "DIESEL"
+    assert body["power_hp"] == 50
+    assert body["brand"] == "Test Motors"
+    assert body["model"] == "TX 500"
+
+
+async def test_editing_a_registration_to_an_invalid_plate_is_a_422(
+    client: AsyncClient,
+) -> None:
+    token = await _token(client, "9810000054")
+    vehicle = await _create(client, token, registration_number="TN38HH9999")
+
+    response = await client.patch(
+        f"{API}/provider/vehicles/{vehicle['id']}",
+        json={"registration_number": "NOPE"},
+        headers=_auth(token),
+    )
+
+    assert response.status_code == 422
+    fields = [f["field"] for f in response.json()["error"]["details"]["fields"]]
+    assert "registration_number" in fields

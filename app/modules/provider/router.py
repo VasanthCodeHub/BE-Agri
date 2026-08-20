@@ -2,18 +2,16 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel
 from fastapi import APIRouter, Depends
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.db.session import get_db
 from app.modules.auth.dependencies import require_role
-from app.modules.bookings.models import BookingStatus
-from app.modules.bookings.repository import BookingRepository
+from app.modules.contact.repository import ContactCallRepository
+from app.modules.favourites.repository import FavouriteRepository
 from app.modules.users.models import User, UserRole
-from app.modules.vehicles.models import Vehicle
 from app.modules.vehicles.repository import VehicleRepository
 
 log = get_logger(__name__)
@@ -21,11 +19,22 @@ router = APIRouter()
 
 
 class ProviderSummaryOut(BaseModel):
-    total_vehicles: int
-    active_rentals: int
-    completed_rentals: int
-    lifetime_earnings_paise: int
-    lifetime_earnings_rupees: float
+    """The provider's dashboard, scoped to THEIR listings only.
+
+    The product has no bookings, so the interesting numbers are interest and
+    reputation: how many favourites and calls the listings draw, and what
+    renters have said about them.
+    """
+
+    total_vehicles: int = Field(description="Live listings (not soft-deleted).")
+    available_vehicles: int = Field(description="Currently on the public feed.")
+    unavailable_vehicles: int = Field(description="Toggled off by the provider.")
+    favourite_count: int = Field(description="Favourites across all of the provider's vehicles.")
+    contact_call_count: int = Field(description="Calls initiated toward the provider's vehicles.")
+    review_count: int = Field(description="Reviews written about the provider's vehicles.")
+    average_rating: float | None = Field(
+        description="Mean star rating across reviews, 1-5. Null when no reviews exist."
+    )
 
 
 @router.get(
@@ -39,18 +48,41 @@ async def provider_summary(
     provider: User = Depends(require_role(UserRole.PROVIDER)),
     db: AsyncSession = Depends(get_db),
 ) -> ProviderSummaryOut:
-    vehicle_repo = VehicleRepository(db)
-    booking_repo = BookingRepository(db)
+    """Statistics for the authenticated provider's own listings.
 
-    total_vehicles = await vehicle_repo.count_for_provider(provider.id)
-    active = await booking_repo.count_for_provider(provider.id, status="ACTIVE")
-    completed = await booking_repo.count_for_provider(provider.id, status="COMPLETED")
-    earnings = await booking_repo.earnings_for_provider(provider.id)
+    Every number is derived from the provider's live vehicles, never from
+    anyone else's. Requires the PROVIDER role.
+    """
+    vehicles = VehicleRepository(db)
+    favourites = FavouriteRepository(db)
+    calls = ContactCallRepository(db)
+
+    total_vehicles = await vehicles.count_for_provider(provider_user_id=provider.id)
+    available = await vehicles.count_available_for_provider(provider_user_id=provider.id)
+    owned_ids = await vehicles.list_owned_ids(provider_user_id=provider.id)
+
+    favourite_count = await favourites.count_for_vehicles(vehicle_ids=owned_ids)
+    call_count = await calls.count_for_provider_vehicles(
+        provider_user_id=provider.id, vehicle_ids=owned_ids
+    )
+
+    stats = await vehicles.review_stats(owned_ids)
+    review_count = sum(count for _, count in stats.values())
+    rating_values = [rating for rating, _ in stats.values() if rating is not None]
+    average_rating = round(sum(rating_values) / len(rating_values), 2) if rating_values else None
+
+    log.info(
+        "provider_summary",
+        provider_id=str(provider.id),
+        total_vehicles=total_vehicles,
+    )
 
     return ProviderSummaryOut(
         total_vehicles=total_vehicles,
-        active_rentals=active,
-        completed_rentals=completed,
-        lifetime_earnings_paise=earnings,
-        lifetime_earnings_rupees=earnings / 100.0,
+        available_vehicles=available,
+        unavailable_vehicles=total_vehicles - available,
+        favourite_count=favourite_count,
+        contact_call_count=call_count,
+        review_count=review_count,
+        average_rating=average_rating,
     )

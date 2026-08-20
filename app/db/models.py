@@ -14,18 +14,19 @@ the difference between a safe migration and a data-loss migration.
 
 from app.db.base import Base
 from app.modules.auth.models import OtpRequest, RefreshToken
+from app.modules.contact.models import ContactCall
 from app.modules.favourites.models import Favourite
+from app.modules.masters.models import VehicleManufacturer, VehicleModel, VehicleVariant
 from app.modules.notifications.models import Notification
 from app.modules.reviews.models import Review
 from app.modules.users.models import User, UserRoleAssignment
 from app.modules.vehicles.models import Vehicle, VehicleImage, VehicleType
-from app.modules.bookings.models import Booking  # uncomment when bookings module exists
 
 # Listing them here marks the imports as intentional re-exports, so linters do
 # not flag them as unused.
 __all__ = [
     "Base",
-    "Booking",
+    "ContactCall",
     "Favourite",
     "Notification",
     "OtpRequest",
@@ -35,5 +36,8 @@ __all__ = [
     "UserRoleAssignment",
     "Vehicle",
     "VehicleImage",
+    "VehicleManufacturer",
+    "VehicleModel",
     "VehicleType",
+    "VehicleVariant",
 ]

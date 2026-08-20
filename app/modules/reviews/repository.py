@@ -49,9 +49,7 @@ class ReviewRepository:
 
     async def get_by_id(self, review_id: uuid.UUID) -> Review | None:
         result = await self.db.execute(
-            select(Review)
-            .options(selectinload(Review.reviewer))
-            .where(Review.id == review_id)
+            select(Review).options(selectinload(Review.reviewer)).where(Review.id == review_id)
         )
         return result.scalar_one_or_none()
 

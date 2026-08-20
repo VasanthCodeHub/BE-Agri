@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from app.core.config import Settings
 from app.core.logging import get_logger
-from app.modules.notifications.models import NotificationType
+from app.modules.notifications.models import Notification, NotificationType
 from app.modules.notifications.repository import NotificationRepository
 from app.modules.notifications.schemas import NotificationOut, NotificationPage
 from app.modules.users.models import User

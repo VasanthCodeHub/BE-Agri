@@ -22,12 +22,16 @@ from app.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 class UserRole(StrEnum):
     """Roles a user can hold.
 
+    `USER` is the normal consumer of the app — browsing vehicles, favouriting,
+    reviewing, calling providers. `PROVIDER` is a vehicle owner. One phone
+    number can hold both roles.
+
     ADMIN is deliberately absent for now. When it returns (Phase 5, provider
     verification) admins will be created by script — never assignable through
     the public login endpoint, which would be privilege escalation.
     """
 
-    RENTER = "RENTER"
+    USER = "USER"
     PROVIDER = "PROVIDER"
 
 

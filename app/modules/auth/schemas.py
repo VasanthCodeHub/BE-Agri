@@ -38,8 +38,8 @@ class OtpRequestIn(BaseModel):
     # through a public endpoint.
     role: UserRole = Field(
         ...,
-        description="Which experience to log in to. Choose RENTER or PROVIDER.",
-        examples=["RENTER"],
+        description="Which experience to log in to. Choose USER or PROVIDER.",
+        examples=["USER"],
     )
 
     @field_validator("phone")
@@ -58,7 +58,10 @@ class OtpRequestOut(BaseModel):
     phone: str = Field(description="Masked, for display back to the user.")
     is_new_user: bool = Field(description="True if this number has never logged in.")
     name_required: bool = Field(
-        description="True when the app should show the name field before verifying."
+        description=(
+            "Deprecated: always false. Profile fields are collected after "
+            "login via PATCH /me, never at verification."
+        )
     )
     otp_sent: bool
     expires_in: int = Field(description="Seconds until the code expires.")
@@ -68,7 +71,7 @@ class OtpRequestOut(BaseModel):
             "example": {
                 "phone": "+9198****3210",
                 "is_new_user": True,
-                "name_required": True,
+                "name_required": False,
                 "otp_sent": True,
                 "expires_in": 300,
             }
@@ -80,7 +83,15 @@ class OtpRequestOut(BaseModel):
 # Step 2 — verify the OTP
 # ---------------------------------------------------------------------------
 class OtpVerifyIn(BaseModel):
-    """Body for POST /auth/otp/verify."""
+    """Body for POST /auth/otp/verify — authentication only.
+
+    Exactly two fields: the phone number and the code. The selected role comes
+    from the OTP record created at request time, never from this request, and
+    profile fields (name, email, address, ...) belong to PATCH /me after login.
+    Anything else is rejected rather than silently ignored.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     phone: str = Field(..., examples=["9876543210"])
     code: str = Field(
@@ -90,26 +101,6 @@ class OtpVerifyIn(BaseModel):
         "for any number.",
         examples=["0000"],
     )
-    name: str | None = Field(
-        default=None,
-        max_length=120,
-        description="Required only for a new user (when name_required was true).",
-        examples=["Vasanth"],
-    )
-    email: str | None = Field(
-        default=None,
-        max_length=254,
-        description="Optional, collected at registration.",
-        examples=["vasanth@example.com"],
-    )
-    address: str | None = Field(
-        default=None,
-        max_length=255,
-        description="Optional, collected at registration.",
-        examples=["12 Gandhi Street, Sulur, Coimbatore"],
-    )
-    latitude: float | None = Field(default=None, ge=-90, le=90, examples=[11.0246])
-    longitude: float | None = Field(default=None, ge=-180, le=180, examples=[77.1252])
 
     @field_validator("phone")
     @classmethod
@@ -129,18 +120,24 @@ class OtpVerifyIn(BaseModel):
             raise ValueError("The code must be between 4 and 8 digits.")
         return code
 
-    @field_validator("name")
-    @classmethod
-    def _clean_name(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        name = " ".join(value.split())  # collapse runs of whitespace
-        return name or None
-
 
 # ---------------------------------------------------------------------------
 # The user, as the API exposes them
 # ---------------------------------------------------------------------------
+class OnboardingOut(BaseModel):
+    """Where the user stands on profile completion.
+
+    Not derived from whether the phone number is new: an existing user can
+    still be missing profile fields, and a new user can complete them in the
+    same session.
+    """
+
+    profile_completed: bool
+    needs_profile_completion: bool = Field(
+        description="True → the app shows the name/email/location form, then PATCH /me."
+    )
+
+
 class UserOut(BaseModel):
     """A user, safe to return to that user.
 
@@ -152,23 +149,37 @@ class UserOut(BaseModel):
     id: uuid.UUID
     phone: str
     full_name: str | None
+    email: str | None = Field(description="Owner-only. Null until the profile is completed.")
+    address: str | None = Field(description="Owner-only. Null until the profile is completed.")
     roles: list[str] = Field(description="Every role this user holds.")
     active_role: str = Field(description="The role they logged in as.")
     profile_complete: bool = Field(
-        description="False when the app should send the user to complete their profile."
+        description=(
+            "False when the app should send the user to complete their profile. "
+            "Mirrors `onboarding.profile_completed`."
+        )
     )
+    onboarding: OnboardingOut
 
     @classmethod
     def from_user(cls, user: User, *, active_role: UserRole) -> UserOut:
+        # "Complete" means the three fields the profile form collects are all
+        # present — never just "the phone is new". The profile form lives after
+        # login (PATCH /me), so name alone no longer counts as done.
+        completed = bool(user.full_name and user.email and user.address)
         return cls(
             id=user.id,
             phone=mask_phone(user.phone_e164),
             full_name=user.full_name,
+            email=user.email,
+            address=user.address,
             roles=user.roles,
             active_role=active_role.value,
-            # For now, "complete" just means we have a name. Phase 2 extends
-            # this to the renter/provider profile records.
-            profile_complete=bool(user.full_name),
+            profile_complete=completed,
+            onboarding=OnboardingOut(
+                profile_completed=completed,
+                needs_profile_completion=not completed,
+            ),
         )
 
 

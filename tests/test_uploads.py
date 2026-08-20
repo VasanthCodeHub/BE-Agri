@@ -32,9 +32,7 @@ SECRET = "test-cloudinary-secret"  # matches the conftest settings fixture
 
 async def _token(client: AsyncClient, phone: str, role: str = "PROVIDER") -> str:
     await client.post(f"{AUTH}/otp/request", json={"phone": phone, "role": role})
-    response = await client.post(
-        f"{AUTH}/otp/verify", json={"phone": phone, "code": "0000", "name": "Owner"}
-    )
+    response = await client.post(f"{AUTH}/otp/verify", json={"phone": phone, "code": "0000"})
     assert response.status_code == 200, response.text
     token: str = response.json()["access_token"]
     return token
@@ -66,8 +64,8 @@ async def test_the_signature_endpoint_needs_a_token(client: AsyncClient) -> None
     assert response.json()["error"]["code"] == "TOKEN_MISSING"
 
 
-async def test_a_renter_cannot_get_a_signature(client: AsyncClient) -> None:
-    token = await _token(client, "9820000002", role="RENTER")
+async def test_a_user_cannot_get_a_signature(client: AsyncClient) -> None:
+    token = await _token(client, "9820000002", role="USER")
 
     response = await client.post(SIGN, headers={"Authorization": f"Bearer {token}"})
 

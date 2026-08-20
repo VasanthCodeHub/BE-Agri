@@ -7,34 +7,30 @@ Two groups, and the difference between them is who may call:
   GET    /provider/vehicles/{id}                   provider only, own listings
   PATCH  /provider/vehicles/{id}                   provider only, own listings
   PATCH  /provider/vehicles/{id}/availability      provider only, own listings
-  GET    /provider/vehicles/{id}/availability      provider only, own listings (read)
   DELETE /provider/vehicles/{id}                   provider only, own listings
 
   GET    /vehicles                                 public — no token needed
   GET    /vehicles/{id}                            public — no token needed
   GET    /vehicle-types                            public — the app's picker
-  POST   /contact/call                             public — masked calling
 
-The public feed is deliberately unauthenticated (Q11: browsing is anonymous,
-login is required only to call a provider).
+The public feed is deliberately unauthenticated (browsing is anonymous;
+login is required only to call a provider — see the contact module).
 """
 
 from __future__ import annotations
 
 import uuid
-from datetime import datetime as dt, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query, Response, status
-from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
-from app.core.exceptions import NotFoundError, ServiceUnavailableError
 from app.core.logging import get_logger
 from app.db.session import get_db
 from app.modules.auth.dependencies import require_role
+from app.modules.masters.repository import MasterRepository
+from app.modules.masters.service import MasterService
 from app.modules.users.models import User, UserRole
-from app.modules.vehicles.models import Vehicle, VehicleType
 from app.modules.vehicles.repository import VehicleRepository
 from app.modules.vehicles.schemas import (
     VehicleCardOut,
@@ -59,7 +55,11 @@ def get_vehicle_service(
     db: AsyncSession = Depends(get_db),
     settings: Settings = Depends(get_settings),
 ) -> VehicleService:
-    return VehicleService(repo=VehicleRepository(db), settings=settings)
+    return VehicleService(
+        repo=VehicleRepository(db),
+        settings=settings,
+        masters=MasterService(repo=MasterRepository(db)),
+    )
 
 
 def _build_search_params(
@@ -211,11 +211,19 @@ async def delete_vehicle(
 )
 async def list_available_vehicles(
     service: VehicleService = Depends(get_vehicle_service),
-    type_code: str | None = Query(default=None, description="Filter by vehicle type code.", examples=["TRACTOR"]),
-    lat: float | None = Query(default=None, ge=-90, le=90, description="User latitude for geo-search."),
-    lng: float | None = Query(default=None, ge=-180, le=180, description="User longitude for geo-search."),
+    type_code: str | None = Query(
+        default=None, description="Filter by vehicle type code.", examples=["TRACTOR"]
+    ),
+    lat: float | None = Query(
+        default=None, ge=-90, le=90, description="User latitude for geo-search."
+    ),
+    lng: float | None = Query(
+        default=None, ge=-180, le=180, description="User longitude for geo-search."
+    ),
     radius_km: float | None = Query(default=None, gt=0, le=500, description="Search radius in km."),
-    q: str | None = Query(default=None, max_length=100, description="Text search on name, brand, location."),
+    q: str | None = Query(
+        default=None, max_length=100, description="Text search on name, brand, location."
+    ),
     max_price: float | None = Query(default=None, gt=0, description="Max price per unit (paise)."),
     available_only: bool = Query(default=True),
     sort: str = Query(default="newest", pattern="^(newest|distance|price_asc|price_desc)$"),
@@ -249,91 +257,3 @@ async def get_vehicle(
     service: VehicleService = Depends(get_vehicle_service),
 ) -> VehicleCardOut:
     return await service.get_public_vehicle(vehicle_id=vehicle_id)
-
-
-# ---------------------------------------------------------------------------
-# Masked calling
-# ---------------------------------------------------------------------------
-class CallInitiateIn(BaseModel):
-    vehicle_id: uuid.UUID
-
-    model_config = {
-        "json_schema_extra": {
-            "example": {"vehicle_id": "3f2a-1234-5678-90ab-cdef01234567"}
-        }
-    }
-
-
-class CallInitiateOut(BaseModel):
-    call_id: uuid.UUID
-    proxy_number: str
-    expires_at: str
-    message: str = "Dial the proxy number to connect. It expires in 15 minutes."
-
-    model_config = {
-        "json_schema_extra": {
-            "example": {
-                "call_id": "call-1234...",
-                "proxy_number": "+9198765xxxxx",
-                "expires_at": "2026-08-19T12:15:00Z",
-            }
-        }
-    }
-
-
-@router.post(
-    "/contact/call",
-    response_model=CallInitiateOut,
-    tags=["contact"],
-    summary="Initiate a masked call to a provider",
-    responses={
-        401: {"description": "Missing or invalid token (renter role required)"},
-        404: {"description": "Vehicle not found or not discoverable"},
-        503: {"description": "Masked calling not configured"},
-    },
-)
-async def initiate_call(
-    payload: CallInitiateIn,
-    user: User = Depends(require_role(UserRole.RENTER)),
-    settings: Settings = Depends(get_settings),
-    db: AsyncSession = Depends(get_db),
-) -> CallInitiateOut:
-    """Return a proxy phone number for a renter to call the provider of a vehicle.
-
-    The renter must be authenticated (RENTER role). The vehicle must be
-    discoverable. The provider's real number is never revealed.
-
-    MVP behaviour: logs the call request and returns a synthetic proxy number.
-    Production: integrate Twilio / Exotel / Knowlarity for a real proxy call.
-    """
-    repo = VehicleRepository(db)
-    vehicle = await repo.get_public_by_id(payload.vehicle_id)
-    if vehicle is None:
-        raise NotFoundError("Vehicle not found or not available.", code="VEHICLE_NOT_FOUND")
-
-    provider_user = vehicle.provider
-    if provider_user is None or not provider_user.phone_e164:
-        raise ServiceUnavailableError(
-            "The provider has no contact number on file.",
-            code="PROVIDER_NOT_CONTACTABLE",
-        )
-
-    log.info(
-        "call_initiated",
-        caller_id=str(user.id),
-        provider_id=str(vehicle.provider_user_id),
-        vehicle_id=str(payload.vehicle_id),
-    )
-
-    # For MVP testing: return a masked proxy based on the provider's real number.
-    # Swap this block for Twilio Client / Proxy integration in production.
-    real_number = provider_user.phone_e164
-    masked = real_number[:-4] + "xxxx"  # e.g. +9198765xxxxx
-    expires = dt.now(timezone.utc) + timedelta(minutes=15)
-
-    return CallInitiateOut(
-        call_id=uuid.uuid4(),
-        proxy_number=masked,
-        expires_at=expires.isoformat(),
-        message=f"Dial {masked} to call the provider. Your real number is hidden.",
-    )

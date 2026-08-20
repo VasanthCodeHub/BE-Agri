@@ -31,7 +31,7 @@ class OtpRequest(UUIDPrimaryKeyMixin, Base):
 
     #: The role the user chose before the code was sent. Verification reads the
     #: role from HERE rather than from the verify request, so a client cannot
-    #: request a code as RENTER and then verify as PROVIDER.
+    #: request a code as USER and then verify as PROVIDER.
     requested_role: Mapped[UserRole] = mapped_column(user_role_enum)
 
     #: Wrong guesses so far. Once this hits the configured maximum the record is

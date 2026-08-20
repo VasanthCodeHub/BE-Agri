@@ -16,9 +16,14 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+)
 
 from app.core.config import Settings
 from app.integrations.cloudinary import (
@@ -28,7 +33,6 @@ from app.integrations.cloudinary import (
 )
 from app.modules.vehicles.models import (
     MAX_IMAGES,
-    MIN_IMAGES,
     FuelType,
     ListingStatus,
     PriceUnit,
@@ -104,7 +108,15 @@ class VehicleSearchParams(BaseModel):
 # Creating a listing
 # ---------------------------------------------------------------------------
 class VehicleCreateIn(BaseModel):
-    """Body for POST /provider/vehicles. Every field is required."""
+    """Body for POST /provider/vehicles.
+
+    When `model_id` or `variant_id` is given, `brand`, `model`,
+    `vehicle_type_code`, `fuel_type` and `power_hp` are NOT needed — the
+    backend derives them from the master data. If they ARE sent anyway, the
+    master row still wins: a conflicting `vehicle_type_code` is rejected
+    (INVALID_MASTER_COMBINATION) and the canonical values are stored.
+    Without master references, the free-text listing path requires all five.
+    """
 
     name: str = Field(
         ...,
@@ -113,18 +125,73 @@ class VehicleCreateIn(BaseModel):
         description="What the owner calls it.",
         examples=["Mahindra 575 DI"],
     )
-    vehicle_type_code: str = Field(
-        ...,
-        description="A `code` from GET /vehicle-types.",
+    #: Optional master-data references from GET /vehicle-masters. When set, the
+    #: brand/model/type/fuel/power fields below are overwritten with the
+    #: canonical values, and every combination is validated against the master
+    #: data. Declared before the spec fields on purpose: the free-text
+    #: validator reads `model_id`/`variant_id`, so they must be validated first.
+    manufacturer_id: uuid.UUID | None = Field(
+        default=None, description="From GET /vehicle-masters.", examples=[None]
+    )
+    model_id: uuid.UUID | None = Field(
+        default=None, description="From GET /vehicle-masters.", examples=[None]
+    )
+    variant_id: uuid.UUID | None = Field(
+        default=None, description="From GET /vehicle-masters.", examples=[None]
+    )
+    vehicle_type_code: str | None = Field(
+        default=None,
+        validate_default=True,
+        description=(
+            "A `code` from GET /vehicle-types. Derived from master data when "
+            "a model/variant is given."
+        ),
         examples=["TRACTOR"],
     )
-    brand: str = Field(..., min_length=1, max_length=60, examples=["Mahindra"])
-    model: str = Field(..., min_length=1, max_length=60, examples=["575 DI"])
+    brand: str | None = Field(
+        default=None,
+        validate_default=True,
+        min_length=1,
+        max_length=60,
+        description="Derived from master data when a model/variant is given.",
+        examples=["Mahindra"],
+    )
+    model: str | None = Field(
+        default=None,
+        validate_default=True,
+        min_length=1,
+        max_length=60,
+        description="Derived from master data when a model/variant is given.",
+        examples=["575 DI"],
+    )
     manufacture_year: int = Field(..., ge=1950, le=2100, examples=[2019])
     registration_number: str = Field(
         ...,
         description="Any format — normalised to TN38AB1234. Must not already be listed.",
         examples=["TN 38 AB 1234"],
+    )
+    rc_number: str | None = Field(
+        default=None,
+        max_length=40,
+        description="RC book number of this physical vehicle. Private — owner-only.",
+        examples=["TN38R1234567890"],
+    )
+    rc_document_public_id: str | None = Field(
+        default=None,
+        description=(
+            "Cloudinary public_id of the RC document, uploaded via the same signed flow as photos."
+        ),
+        examples=["agri/documents/rc/9f8e7d6c"],
+    )
+    engine_number: str | None = Field(
+        default=None,
+        max_length=40,
+        description="Engine number of this physical vehicle. Private — owner-only.",
+    )
+    chassis_number: str | None = Field(
+        default=None,
+        max_length=40,
+        description="Chassis number of this physical vehicle. Private — owner-only.",
     )
     note: str = Field(
         ...,
@@ -148,14 +215,21 @@ class VehicleCreateIn(BaseModel):
         description="Where the vehicle is based.",
         examples=["Sulur, Coimbatore"],
     )
-    fuel_type: FuelType = Field(..., examples=["DIESEL"])
-    power_hp: int = Field(
-        ...,
+    fuel_type: FuelType | None = Field(
+        default=None,
+        validate_default=True,
+        description="Derived from master data when a model/variant is given.",
+        examples=["DIESEL"],
+    )
+    power_hp: int | None = Field(
+        default=None,
+        validate_default=True,
         ge=0,
         le=2000,
         description=(
-            "Engine power in HP. 0 is valid for non-motorised implements "
-            "(rotavators, trailers, ploughs)."
+            "Engine power in HP. Derived from master data when a model/variant "
+            "is given. 0 is valid for non-motorised implements (rotavators, "
+            "trailers, ploughs)."
         ),
         examples=[47],
     )
@@ -184,19 +258,38 @@ class VehicleCreateIn(BaseModel):
 
     @field_validator("vehicle_type_code")
     @classmethod
-    def _upper_code(cls, value: str) -> str:
+    def _upper_code(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         code = value.strip().upper()
         if not code:
-            raise ValueError("vehicle_type_code is required.")
+            raise ValueError("vehicle_type_code cannot be blank.")
         return code
 
     @field_validator("name", "brand", "model", "location_text", "note")
     @classmethod
-    def _collapse_whitespace(cls, value: str) -> str:
+    def _collapse_whitespace(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         cleaned = " ".join(value.split())
         if not cleaned:
             raise ValueError("This field cannot be blank.")
         return cleaned
+
+    @field_validator("rc_number", "engine_number", "chassis_number")
+    @classmethod
+    def _trim_identity(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = " ".join(value.split())
+        return cleaned or None
+
+    @field_validator("rc_document_public_id")
+    @classmethod
+    def _check_rc_document(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _validate_public_id(value)
 
     @field_validator("image_public_ids")
     @classmethod
@@ -205,6 +298,31 @@ class VehicleCreateIn(BaseModel):
         if len(set(ids)) != len(ids):
             raise ValueError("The same image is listed more than once.")
         return ids
+
+    @field_validator("brand", "model", "vehicle_type_code", "fuel_type", "power_hp")
+    @classmethod
+    def _free_text_path_requires_all_specs(
+        cls, value: str | None, info: ValidationInfo
+    ) -> str | None:
+        """Master path or free-text path, never a mix.
+
+        When a model/variant from master data is chosen, these five fields are
+        derived server-side and stay optional. Without one, the free-text path
+        needs all five. Raising per-field (not a model-level error) keeps the
+        422 field names meaningful to the client.
+
+        The five fields carry `validate_default=True` so omitting them is
+        exactly the same error as sending nulls.
+        """
+        has_master = (
+            info.data.get("model_id") is not None or info.data.get("variant_id") is not None
+        )
+        if value is None and not has_master:
+            raise ValueError(
+                "Required on the free-text path — choose a model/variant from "
+                "GET /vehicle-masters, or send this field."
+            )
+        return value
 
 
 # ---------------------------------------------------------------------------
@@ -215,9 +333,31 @@ class VehicleUpdateIn(BaseModel):
 
     name: str | None = Field(default=None, min_length=2, max_length=120)
     vehicle_type_code: str | None = Field(default=None, examples=["HARVESTER"])
+    manufacturer_id: uuid.UUID | None = Field(
+        default=None, description="From GET /vehicle-masters. Null clears it."
+    )
+    model_id: uuid.UUID | None = Field(
+        default=None, description="From GET /vehicle-masters. Null clears it."
+    )
+    variant_id: uuid.UUID | None = Field(
+        default=None, description="From GET /vehicle-masters. Null clears it."
+    )
     brand: str | None = Field(default=None, min_length=1, max_length=60)
     model: str | None = Field(default=None, min_length=1, max_length=60)
     manufacture_year: int | None = Field(default=None, ge=1950, le=2100)
+    registration_number: str | None = Field(
+        default=None,
+        description=(
+            "Any format — normalised to TN38AB1234. Must not already be listed "
+            "by another live vehicle."
+        ),
+    )
+    rc_number: str | None = Field(default=None, max_length=40, description="Null clears it.")
+    rc_document_public_id: str | None = Field(
+        default=None, description="Cloudinary public_id. Null clears it."
+    )
+    engine_number: str | None = Field(default=None, max_length=40, description="Null clears it.")
+    chassis_number: str | None = Field(default=None, max_length=40, description="Null clears it.")
     note: str | None = Field(default=None, min_length=1, max_length=1000)
     price_amount: int | None = Field(
         default=None, gt=0, le=_MAX_PRICE_PAISE, description="In paise. ₹500 = 50000."
@@ -247,6 +387,16 @@ class VehicleUpdateIn(BaseModel):
             raise ValueError("vehicle_type_code cannot be blank.")
         return code
 
+    @field_validator("registration_number")
+    @classmethod
+    def _normalise_registration(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            return normalise_registration_number(value)
+        except InvalidRegistrationNumberError as exc:
+            raise ValueError(str(exc)) from exc
+
     @field_validator("name", "brand", "model", "location_text", "note")
     @classmethod
     def _collapse_whitespace(cls, value: str | None) -> str | None:
@@ -256,6 +406,21 @@ class VehicleUpdateIn(BaseModel):
         if not cleaned:
             raise ValueError("This field cannot be blank.")
         return cleaned
+
+    @field_validator("rc_number", "engine_number", "chassis_number")
+    @classmethod
+    def _trim_identity(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = " ".join(value.split())
+        return cleaned or None
+
+    @field_validator("rc_document_public_id")
+    @classmethod
+    def _check_rc_document(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _validate_public_id(value)
 
     @field_validator("image_public_ids")
     @classmethod
@@ -297,8 +462,28 @@ class VehicleOut(BaseModel):
     vehicle_type: VehicleTypeOut
     brand: str
     model: str
+    #: Null when the listing predates master data or the provider chose not to
+    #: use it. `brand`/`model` always carry the display names either way.
+    manufacturer_id: uuid.UUID | None
+    model_id: uuid.UUID | None
+    variant_id: uuid.UUID | None
     manufacture_year: int
     registration_number: str = Field(description="Owner-only — never on the public feed.")
+    rc_number: str | None = Field(
+        description="Owner-only — private vehicle identity, never on the public feed."
+    )
+    rc_document_public_id: str | None = Field(
+        description="Owner-only — Cloudinary public_id of the RC document."
+    )
+    rc_document_url: str | None = Field(
+        description="Owner-only — full-size URL. Null if Cloudinary is not configured."
+    )
+    engine_number: str | None = Field(
+        description="Owner-only — private vehicle identity, never on the public feed."
+    )
+    chassis_number: str | None = Field(
+        description="Owner-only — private vehicle identity, never on the public feed."
+    )
     note: str
     price_amount: int = Field(description="In paise.")
     price_unit: PriceUnit
@@ -323,8 +508,20 @@ class VehicleOut(BaseModel):
             vehicle_type=VehicleTypeOut.from_model(vehicle.vehicle_type),
             brand=vehicle.brand,
             model=vehicle.model,
+            manufacturer_id=vehicle.manufacturer_id,
+            model_id=vehicle.model_id,
+            variant_id=vehicle.variant_id,
             manufacture_year=vehicle.manufacture_year,
             registration_number=vehicle.registration_number,
+            rc_number=vehicle.rc_number,
+            rc_document_public_id=vehicle.rc_document_public_id,
+            rc_document_url=(
+                build_url(vehicle.rc_document_public_id, settings)
+                if vehicle.rc_document_public_id
+                else None
+            ),
+            engine_number=vehicle.engine_number,
+            chassis_number=vehicle.chassis_number,
             note=vehicle.note,
             price_amount=vehicle.price_amount,
             price_unit=vehicle.price_unit,
@@ -356,6 +553,9 @@ class VehicleCardOut(BaseModel):
     vehicle_type: VehicleTypeOut
     brand: str
     model: str
+    manufacturer_id: uuid.UUID | None
+    model_id: uuid.UUID | None
+    variant_id: uuid.UUID | None
     manufacture_year: int
     note: str
     price_amount: int = Field(description="In paise.")
@@ -380,6 +580,9 @@ class VehicleCardOut(BaseModel):
                 "vehicle_type": {"code": "TRACTOR", "name_en": "Tractor", "name_ta": "டிராக்டர்"},
                 "brand": "Mahindra",
                 "model": "575 DI",
+                "manufacturer_id": "…",
+                "model_id": "…",
+                "variant_id": None,
                 "manufacture_year": 2019,
                 "note": "Well maintained.",
                 "price_amount": 50000,
@@ -421,6 +624,9 @@ class VehicleCardOut(BaseModel):
             vehicle_type=VehicleTypeOut.from_model(vehicle.vehicle_type),
             brand=vehicle.brand,
             model=vehicle.model,
+            manufacturer_id=vehicle.manufacturer_id,
+            model_id=vehicle.model_id,
+            variant_id=vehicle.variant_id,
             manufacture_year=vehicle.manufacture_year,
             note=vehicle.note,
             price_amount=vehicle.price_amount,

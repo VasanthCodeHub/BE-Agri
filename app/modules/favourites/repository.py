@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from sqlalchemy import Select, select
+from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -19,9 +19,7 @@ class FavouriteRepository:
     async def add(self, *, user_id: uuid.UUID, vehicle_id: uuid.UUID) -> Favourite:
         existing = await self.is_favourited(user_id=user_id, vehicle_id=vehicle_id)
         if existing:
-            raise RuntimeError(
-                "Favourite already exists — call is_favourited before add."
-            )
+            raise RuntimeError("Favourite already exists — call is_favourited before add.")
 
         favourite = Favourite(user_id=user_id, vehicle_id=vehicle_id)
         self.db.add(favourite)
@@ -52,6 +50,15 @@ class FavouriteRepository:
             )
         )
         return result.scalar_one_or_none() is not None
+
+    async def count_for_vehicles(self, *, vehicle_ids: list[uuid.UUID]) -> int:
+        """How many favourites a set of vehicles has accumulated — dashboard use."""
+        if not vehicle_ids:
+            return 0
+        result = await self.db.execute(
+            select(func.count()).select_from(Favourite).where(Favourite.vehicle_id.in_(vehicle_ids))
+        )
+        return int(result.scalar() or 0)
 
     async def list_for_user(
         self,

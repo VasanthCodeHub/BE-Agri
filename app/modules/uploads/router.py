@@ -15,9 +15,9 @@ from fastapi import APIRouter, Depends, status
 
 from app.core.config import Settings, get_settings
 from app.modules.auth.dependencies import require_role
-from app.modules.users.models import User, UserRole
 from app.modules.uploads.schemas import UploadSignatureOut
 from app.modules.uploads.service import UploadService
+from app.modules.users.models import User, UserRole
 
 router = APIRouter()
 

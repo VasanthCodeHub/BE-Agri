@@ -11,7 +11,6 @@ from app.core.config import Settings, get_settings
 from app.core.logging import get_logger
 from app.db.session import get_db
 from app.modules.auth.dependencies import get_current_user
-from app.modules.notifications.models import Notification
 from app.modules.notifications.repository import NotificationRepository
 from app.modules.notifications.schemas import NotificationOut, NotificationPage
 from app.modules.notifications.service import NotificationService
@@ -42,9 +41,7 @@ async def list_notifications(
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
 ) -> NotificationPage:
-    return await service.list_notifications(
-        user=user, is_read=is_read, limit=limit, offset=offset
-    )
+    return await service.list_notifications(user=user, is_read=is_read, limit=limit, offset=offset)
 
 
 @router.patch(
@@ -63,6 +60,7 @@ async def mark_read(
     notif = await service.repo.get_by_id(notification_id)
     if notif is None:
         from app.core.exceptions import NotFoundError
+
         raise NotFoundError("Notification not found.", code="NOTIFICATION_NOT_FOUND")
     return NotificationOut.model_validate(notif)
 

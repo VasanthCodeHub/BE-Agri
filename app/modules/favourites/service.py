@@ -2,15 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-
 from app.core.config import Settings
-from app.core.exceptions import ConflictError
 from app.core.logging import get_logger
-from app.modules.favourites.models import Favourite
 from app.modules.favourites.repository import FavouriteRepository
 from app.modules.favourites.schemas import FavouriteOut
-
 
 log = get_logger(__name__)
 

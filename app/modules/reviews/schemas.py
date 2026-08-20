@@ -35,7 +35,7 @@ class ReviewOut(BaseModel):
     created_at: datetime
 
     @classmethod
-    def from_model(cls, review: Review) -> "ReviewOut":
+    def from_model(cls, review: Review) -> ReviewOut:
         return cls(
             id=review.id,
             vehicle_id=review.vehicle_id,

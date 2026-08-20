@@ -10,9 +10,9 @@
 | Stack | Python 3.11+ · FastAPI · PostgreSQL 16 + PostGIS · SQLAlchemy 2.0 async · Alembic |
 | Mobile client | Flutter (separate team) |
 | Environments | `local` · `production` |
-| Database | PostgreSQL **18** running locally, `agri_local`, migrations at `171ff741f85d` ✅ · PostGIS **not installed yet** |
-| Status | **Phases 0, 1 and 4 complete; Phase 3 covered by Cloudinary** — auth + vehicle listings working, 112 tests passing. Next: Phase 2 (profiles) |
-| Last updated | 2026-08-14 |
+| Database | PostgreSQL **18** running locally, `agri_local`, migrations at `b7c2d4e6f8a0` ✅ · PostGIS **not installed yet** |
+| Status | **Phases 0, 1, 3, 4 + the app-rework complete** — auth, vehicle listings, master data, contact/call, favourites, reviews, notifications, profile and provider summary working. **Bookings removed by decision (2026-08-21)** |
+| Last updated | 2026-08-21 |
 
 ---
 
@@ -27,10 +27,16 @@ login experiences (User and Provider), plus admin operations.
 ### 1.2 Roles
 
 | Role | MVP capabilities |
-|---|---|
-| **User / Renter** | Register/login, basic profile, search nearby, view listing, initiate protected call |
+|---|---|---|
+| **User** | Register/login, basic profile, search nearby, view listing, initiate call to a provider *(was "Renter" — renamed 2026-08-21)* |
 | **Provider / Owner / Driver** | Register/login, provider profile, add vehicle, upload docs/photos, manage listing status |
 | **Admin** | Manually onboard providers, review documents, approve/reject, support ops |
+
+**Bookings are out of scope by product decision (2026-08-21):** the app has no
+booking flow; users find a vehicle and call the provider directly. The
+`bookings` table and `booking_status`/`session_block` enum types were dropped in
+migration `b7c2d4e6f8a0`, and the `RENTER` role value was renamed to `USER` in
+the same migration.
 
 ### 1.3 MVP scope (PDF §3)
 
@@ -229,8 +235,11 @@ class TelephonyProvider(Protocol):
 virtual numbers), telephony pricing changes, and tests must never place a real
 call.
 
-**Status: vendor not selected** — see Q4. Nothing is built yet. Candidates:
-Exotel (strongest India coverage), Twilio, Plivo, Knowlarity.
+**Status: superseded by product decision (2026-08-21).** The new product
+removes number masking: `POST /api/v1/contact/call` records the call and
+returns the provider's real E.164 number for the caller to dial directly. The
+port/interface below stays valid if masking returns. Candidates if it ever
+does: Exotel (strongest India coverage), Twilio, Plivo, Knowlarity.
 
 ### ADR-009 — Provider phone numbers are never serialised to renters
 
@@ -242,6 +251,11 @@ the ORM model, never on a public read schema.
 **Why:** this is the product's stated privacy promise (PDF §2.2, §5.2 step 12).
 Relying on developers to remember to exclude a field will fail; relying on the
 schema layer will not.
+
+**Revised (2026-08-21):** the product now reveals the provider's number — but
+only through `POST /api/v1/contact/call`, after the caller authenticates and
+the call is recorded. The feed and listing detail remain phone-free, enforced
+structurally as before.
 
 Additionally, `app/core/logging.py` masks phone numbers in **every log line**
 (`+9198****3210`), so they cannot leak through logs either.
@@ -293,8 +307,9 @@ automatically.
 ### ADR-014 — One phone number, multiple roles
 
 **Decision (client requirement, 2026-08-13):** a single user may hold both the
-RENTER and PROVIDER roles. Roles live in a `user_roles` table, not as a column
-on `users`, with `UNIQUE(user_id, role)`.
+USER and PROVIDER roles (the role value was `RENTER` until it was renamed to
+`USER` in migration `b7c2d4e6f8a0`, 2026-08-21). Roles live in a `user_roles`
+table, not as a column on `users`, with `UNIQUE(user_id, role)`.
 
 Selecting a role the user does not yet hold at login **grants** it rather than
 rejecting the login. That is safe because the role by itself confers nothing —
@@ -432,8 +447,12 @@ soft delete where history matters · Postgres enum types · UTC timestamps.
 | `user_profiles` | Renter details | `user_id`, `full_name`, `city`, `preferred_language` |
 | `provider_profiles` | Provider details | `user_id`, `display_name`, `address`, **`location geography(Point,4326)`**, `service_radius_km`, `verification_status`, `verified_at`, `verified_by` |
 | `vehicle_types` ✅ | Seeded taxonomy | `code`, `name_en`, `name_ta`, `sort_order`, `is_active` — reference data, not free text. 12 provisional rows seeded by migration; **Tamil names need a native speaker's review** |
-| `vehicles` ✅ | Listings | `provider_user_id`, `vehicle_type_id`, `registration_number` (**unique among live rows**), `name`, `brand`, `model`, `manufacture_year`, `note`, `price_amount` (paise), `price_unit`, `location_text`, `latitude`/`longitude` (nullable), `fuel_type`, `power_hp`, `transmission`, `is_available`, `listing_status`, `deleted_at` |
+| `vehicles` ✅ | Listings | `provider_user_id`, `vehicle_type_id`, `registration_number` (**unique among live rows**), `name`, `brand`, `model`, `manufacture_year`, `note`, `price_amount` (paise), `price_unit`, `location_text`, `latitude`/`longitude` (nullable), `fuel_type`, `power_hp`, `transmission`, `is_available`, `listing_status`, `deleted_at`, `manufacturer_id`/`model_id`/`variant_id` (nullable master refs, `SET NULL`) |
 | `vehicle_images` ✅ | Photos | `vehicle_id`, **`public_id`** (Cloudinary), `sort_order` — URLs are derived, not stored (ADR-016) |
+| `vehicle_manufacturers` ✅ | Master data | `name` unique, `sort_order`, `is_active` — seeded by `scripts/seed_master_data.py` |
+| `vehicle_models` ✅ | Master data | `manufacturer_id`, `name`, `vehicle_type_id`, `fuel_type`, `power_hp`; unique per manufacturer |
+| `vehicle_variants` ✅ | Master data | `model_id`, `name`, `manufacture_year`, `power_hp`; unique per model |
+| `contact_calls` ✅ | Direct-call log | `caller_user_id`, `provider_user_id`, `vehicle_id`, `created_at` — the dashboard's interest signal now that bookings are gone |
 | `documents` | KYC files | `owner_type`, `owner_id`, `doc_type`, `object_key`, `status`, `reviewed_by`, `rejection_reason` |
 | `verification_events` | Immutable approval audit | `subject_type`, `subject_id`, `from_status`, `to_status`, `actor_id`, `reason` |
 | `otp_requests` | OTP state *(was Redis — ADR-010)* | `phone_e164`, `code_hash`, `attempts`, `expires_at`, `consumed_at` |
@@ -499,6 +518,14 @@ listing.
 ⬜ PATCH  /api/v1/me/provider-profile        # includes location + service radius
 
 ✅ GET    /api/v1/vehicle-types              # seeded taxonomy
+✅ GET    /api/v1/vehicle-masters             # manufacturer → model → variant cascade
+✅ POST   /api/v1/contact/call                # record a call, return the provider's number
+✅ GET    /api/v1/me                          # session check (profile module)
+✅ PATCH  /api/v1/me                          # name, email, address, location
+✅ GET    /api/v1/provider/summary            # dashboard stats, no bookings
+✅ GET/POST /api/v1/vehicles/{id}/favourite, GET /api/v1/favourites
+✅ GET/POST /api/v1/vehicles/{id}/reviews
+✅ GET    /api/v1/notifications + read + read-all
 ✅ POST   /api/v1/provider/uploads/signature # authorises a direct Cloudinary upload
 ✅ POST   /api/v1/provider/vehicles
 ✅ GET    /api/v1/provider/vehicles
@@ -514,7 +541,7 @@ listing.
 ⬜ GET    /api/v1/provider/verification-status
 
 ⬜ GET    /api/v1/search/providers           # lat, lng, radius_km, vehicle_type, cursor
-⬜ POST   /api/v1/calls/initiate             # + Idempotency-Key
+✅ POST   /api/v1/contact/call               # direct call record (was masked /calls/initiate)
 
 ⬜ POST   /api/v1/admin/auth/login
 ⬜ GET    /api/v1/admin/verifications
@@ -819,14 +846,12 @@ Building on these unless corrected. Each is a place the design could shift.
 | ⬜ | Vehicle-type filtering; listing detail (phone-free) |
 | ⬜ | Index-usage (`EXPLAIN`) and query-count tests |
 
-### Phase 7 — Protected calling  ⛔ *Q4, Q5*
+### Phase 7 — Contact & calling ✅ REPLACED
 | | Task |
 |---|---|
-| ⬜ | Telephony port + fake adapter |
-| ⬜ | Vendor adapter once selected |
-| ⬜ | `POST /calls/initiate` with idempotency + rate limit |
-| ⬜ | `call_sessions` lifecycle + signed status webhook |
-| ⬜ | Test asserting no phone number in any renter-facing response |
+| ✅ | `POST /api/v1/contact/call` — any authenticated user calls a vehicle's provider; the call is recorded in `contact_calls` and the provider gets a `CALL_INITIATED` notification |
+| ✅ | The provider's real number is returned **only** to the caller who initiated the call (direct dial per product decision 2026-08-21) |
+| ⬜ | Re-introduce masked calling later if the product changes its mind — ADR-008 port is still valid |
 
 ### Phase 8 — Hardening & production readiness
 | | Task |
@@ -872,6 +897,7 @@ Building on these unless corrected. Each is a place the design could shift.
 | 2026-08-14 | Hit the `MissingGreenlet` trap on `PATCH availability`: `updated_at` carries `onupdate`, and PostgreSQL returns server defaults via `RETURNING` on INSERT but not on UPDATE, so reading it during serialisation lazy-loads. Fixed in the repository |
 | 2026-08-14 | **ADR-016 — Cloudinary signed direct uploads.** `POST /provider/uploads/signature`; `vehicle_images` now stores `public_id` instead of a URL, so thumbnails are derived per request |
 | 2026-08-14 | 112 tests passing, ruff clean, mypy clean; both new migrations verified reversible |
+| 2026-08-21 | **Product rework:** bookings removed entirely (module + table + enum types dropped); role `RENTER` renamed to `USER`; vehicle master data added (manufacturers → models → variants, optional vehicle refs, `GET /vehicle-masters`); `POST /contact/call` replaces masked calling; `GET /me` + `PATCH /me`; provider summary rebuilt without bookings; favourites/reviews/notifications wired; migration `b7c2d4e6f8a0`; idempotent seed script `scripts/seed_master_data.py` |
 
 ## 13. Pending work
 
@@ -883,7 +909,7 @@ Building on these unless corrected. Each is a place the design could shift.
 | SMS to Indian handsets | **DLT registration** (Q3) — weeks of lead time, so a schedule risk |
 | Real photo uploads | Cloudinary credentials + a signed upload preset (see `docs/SETUP.md` §2.6) |
 | Verification & admin | Q7, Q8, Q9 — document list, whether ID numbers are stored, who the admins are |
-| Masked calling | Q4, Q5 — vendor and recording policy. This is the MVP's headline feature |
+| Masked calling | **Removed by decision 2026-08-21** — direct dial via `POST /contact/call`. Re-open if the product wants number masking back (ADR-008) |
 
 **Ready to build now, needs nobody:**
 
@@ -915,3 +941,4 @@ provider earnings analytics.
 | 2026-08-13 | Revised to two environments; ADR-010 revised (Redis deferred); ADR-007/008 marked deferred; ADR-013 added (UUID keys); Phase 0 completed and verified |
 | 2026-08-13 | ADR-014 added (one phone, multiple roles); ADR-015 added (security side effects commit before raising); assumption A2 confirmed; Phase 1 completed |
 | 2026-08-14 | OTP shortened to 4 digits; Twilio SMS adapter added (Q2 answered); ADR-016 added (Cloudinary signed direct uploads); Phase 4 vehicle listings completed; Phase 3 media covered by Cloudinary rather than local disk |
+| 2026-08-21 | Rework per new requirements: bookings removed (module, table, enum types); role `RENTER` → `USER`; vehicle master data + `GET /vehicle-masters`; `POST /contact/call` direct-dial replacing masked calling (ADR-008/009 revised); `GET`/`PATCH /me`; provider summary without bookings; favourites, reviews and notifications wired; migration `b7c2d4e6f8a0`; seed script for master data |

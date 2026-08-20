@@ -14,8 +14,9 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from app.modules.auth.router import router as auth_router
-from app.modules.bookings.router import router as bookings_router
+from app.modules.contact.router import router as contact_router
 from app.modules.favourites.router import router as favourites_router
+from app.modules.masters.router import router as masters_router
 from app.modules.notifications.router import router as notifications_router
 from app.modules.profile.router import router as profile_router
 from app.modules.provider.router import router as provider_router
@@ -34,11 +35,15 @@ api_router.include_router(auth_router, prefix="/auth", tags=["auth"])
 # public ones (/vehicles, /vehicle-types), so the prefixes live on the routes.
 api_router.include_router(vehicles_router)
 
+# Vehicle master data for the app's dropdowns (manufacturer → model → variant).
+api_router.include_router(masters_router)
+
+# Direct contact between a user and a provider — the product has no bookings.
+api_router.include_router(contact_router)
+
 # Upload authorisation. Its own module because provider verification documents
 # (Phase 5) will need the same signature.
 api_router.include_router(uploads_router)
-
-api_router.include_router(bookings_router)
 
 api_router.include_router(favourites_router)
 api_router.include_router(reviews_router)

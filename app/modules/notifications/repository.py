@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
 from typing import Any
 
 from sqlalchemy import Select, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from app.core.security import utc_now
 from app.modules.notifications.models import Notification, NotificationType
@@ -72,8 +70,10 @@ class NotificationRepository:
         await self.db.flush()
         # result is a CursorResult-like object without a rowcount attribute on
         # the generic Result type, so we cast to access it.
-        from sqlalchemy import CursorResult
         from typing import cast
+
+        from sqlalchemy import CursorResult
+
         return cast("CursorResult[Any]", result).rowcount or 0
 
     async def list_for_user(
@@ -84,10 +84,7 @@ class NotificationRepository:
         limit: int,
         offset: int,
     ) -> tuple[list[Notification], int]:
-        base = (
-            select(Notification)
-            .where(Notification.user_id == user_id)
-        )
+        base = select(Notification).where(Notification.user_id == user_id)
         if is_read is not None:
             base = base.where(Notification.is_read.is_(is_read))
         return await self._page(base, limit=limit, offset=offset)

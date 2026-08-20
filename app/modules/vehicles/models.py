@@ -171,6 +171,21 @@ class Vehicle(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         ForeignKey("vehicle_types.id", ondelete="RESTRICT"), index=True
     )
 
+    #: Optional references into the master data. Nullable on purpose: listings
+    #: created before master data existed keep working, and a provider is never
+    #: forced to pick from the catalogue. When set, `brand`/`model` hold the
+    #: canonical names from the master rows (kept denormalised so the text
+    #: search and old clients keep working).
+    manufacturer_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("vehicle_manufacturers.id", ondelete="SET NULL"), index=True
+    )
+    model_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("vehicle_models.id", ondelete="SET NULL"), index=True
+    )
+    variant_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("vehicle_variants.id", ondelete="SET NULL"), index=True
+    )
+
     #: What the owner calls it, e.g. "Mahindra 575 DI".
     name: Mapped[str] = mapped_column(String(120))
     brand: Mapped[str] = mapped_column(String(60))
@@ -186,6 +201,18 @@ class Vehicle(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     #: second index on the same column would be paid for on every write for
     #: nothing.
     registration_number: Mapped[str] = mapped_column(String(20))
+
+    #: RC book details — private to the owner, never on the public feed. One
+    #: model can have thousands of physical vehicles, each with its own RC, so
+    #: these live here and never on the master rows.
+    rc_number: Mapped[str | None] = mapped_column(String(40))
+    #: Cloudinary public_id of the RC document, uploaded via the same signed
+    #: direct-upload flow as photos. A reference, never the file itself.
+    rc_document_public_id: Mapped[str | None] = mapped_column(String(255))
+    #: Engine and chassis numbers identify the physical vehicle. Private —
+    #: provider-facing only, like the RC number above.
+    engine_number: Mapped[str | None] = mapped_column(String(40))
+    chassis_number: Mapped[str | None] = mapped_column(String(40))
 
     note: Mapped[str] = mapped_column(Text)
 

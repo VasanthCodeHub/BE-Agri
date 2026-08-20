@@ -43,16 +43,19 @@ class VehicleRepository:
     # -----------------------------------------------------------------------
     # Writes
     # -----------------------------------------------------------------------
-    async def registration_is_taken(self, registration_number: str) -> bool:
+    async def registration_is_taken(
+        self, registration_number: str, *, exclude_vehicle_id: uuid.UUID | None = None
+    ) -> bool:
         # Normalise here, not just in the schema: the unique index compares the
         # canonical form, so "TN 38 AB 1234" and "TN38AB1234" must both hit it.
         normalised = normalise_registration_number(registration_number)
-        result = await self.db.execute(
-            select(Vehicle.id).where(
-                Vehicle.registration_number == normalised,
-                Vehicle.deleted_at.is_(None),
-            )
+        stmt = select(Vehicle.id).where(
+            Vehicle.registration_number == normalised,
+            Vehicle.deleted_at.is_(None),
         )
+        if exclude_vehicle_id is not None:
+            stmt = stmt.where(Vehicle.id != exclude_vehicle_id)
+        result = await self.db.execute(stmt)
         return result.first() is not None
 
     async def create(self, *, vehicle: Vehicle, public_ids: list[str]) -> Vehicle:
@@ -78,6 +81,28 @@ class VehicleRepository:
             )
         )
         return int(result.scalar() or 0)
+
+    async def count_available_for_provider(self, *, provider_user_id: uuid.UUID) -> int:
+        result = await self.db.execute(
+            select(func.count())
+            .select_from(Vehicle)
+            .where(
+                Vehicle.provider_user_id == provider_user_id,
+                Vehicle.deleted_at.is_(None),
+                Vehicle.is_available.is_(True),
+            )
+        )
+        return int(result.scalar() or 0)
+
+    async def list_owned_ids(self, *, provider_user_id: uuid.UUID) -> list[uuid.UUID]:
+        """Live vehicle ids for a provider — the scope for dashboard stats."""
+        result = await self.db.execute(
+            select(Vehicle.id).where(
+                Vehicle.provider_user_id == provider_user_id,
+                Vehicle.deleted_at.is_(None),
+            )
+        )
+        return list(result.scalars().all())
 
     # -----------------------------------------------------------------------
     # Reads — owner
@@ -122,9 +147,7 @@ class VehicleRepository:
         )
 
     async def get_public_by_id(self, vehicle_id: uuid.UUID) -> Vehicle | None:
-        result = await self.db.execute(
-            self._discoverable().where(Vehicle.id == vehicle_id)
-        )
+        result = await self.db.execute(self._discoverable().where(Vehicle.id == vehicle_id))
         return result.scalars().unique().one_or_none()
 
     async def review_stats(
@@ -147,8 +170,7 @@ class VehicleRepository:
             .group_by(Review.vehicle_id)
         )
         return {
-            vehicle_id: (round(float(avg), 2), int(count))
-            for vehicle_id, avg, count in rows.all()
+            vehicle_id: (round(float(avg), 2), int(count)) for vehicle_id, avg, count in rows.all()
         }
 
     async def list_public(
@@ -210,9 +232,6 @@ class VehicleRepository:
         # so ST_SetSRID(ST_MakePoint(longitude, latitude), 4326) is the geo point.
         # ST_DWithin uses geography distance in metres when both operands are geography.
         if lat is not None and lng is not None:
-            point_clause = text(
-                "ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography"
-            )
             base = base.where(
                 Vehicle.latitude.is_not(None),
                 Vehicle.longitude.is_not(None),
@@ -222,7 +241,8 @@ class VehicleRepository:
                 base = base.where(
                     text(
                         "ST_DWithin("
-                        "  ST_SetSRID(ST_MakePoint(vehicles.longitude, vehicles.latitude), 4326)::geography,"
+                        "  ST_SetSRID(ST_MakePoint(vehicles.longitude, vehicles.latitude), "
+                        "4326)::geography,"
                         "  ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography,"
                         f" {radius_m}"
                         ")"
@@ -233,14 +253,14 @@ class VehicleRepository:
             if sort == "distance":
                 dist_expr = text(
                     "ST_Distance("
-                    "  ST_SetSRID(ST_MakePoint(vehicles.longitude, vehicles.latitude), 4326)::geography,"
+                    "  ST_SetSRID(ST_MakePoint(vehicles.longitude, vehicles.latitude), "
+                    "4326)::geography,"
                     "  ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography"
                     ") / 1000.0"
                 )
             else:
                 dist_expr = None
         else:
-            point_clause = None
             dist_expr = None
 
         # Build column list
@@ -269,7 +289,9 @@ class VehicleRepository:
             if dist_expr is not None:
                 vehicle = row[0]
                 dist_val = row.distance_km  # type: ignore[attr-defined]
-                vehicles.append((vehicle, round(float(dist_val), 2) if dist_val is not None else None))
+                vehicles.append(
+                    (vehicle, round(float(dist_val), 2) if dist_val is not None else None)
+                )
             else:
                 vehicles.append((row[0], None))
 

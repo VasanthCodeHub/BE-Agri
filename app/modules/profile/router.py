@@ -6,11 +6,32 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
 from app.db.session import get_db
-from app.modules.auth.dependencies import get_current_user
-from app.modules.users.models import User
+from app.modules.auth.dependencies import get_active_role, get_current_user
+from app.modules.auth.schemas import UserOut
+from app.modules.users.models import User, UserRole
 
 log = get_logger(__name__)
 router = APIRouter()
+
+
+@router.get(
+    "/me",
+    response_model=UserOut,
+    tags=["profile"],
+    summary="Who am I? (session check)",
+    responses={401: {"description": "Missing, invalid or expired token"}},
+)
+async def me(
+    user: User = Depends(get_current_user),
+    active_role: UserRole = Depends(get_active_role),
+) -> UserOut:
+    """Return the current user — the app's session check.
+
+    Identical to `GET /auth/me`; this shorter path is the one the new app
+    builds call. `onboarding.needs_profile_completion` tells the app whether to
+    route the user to a profile-completion screen first.
+    """
+    return UserOut.from_user(user, active_role=active_role)
 
 
 class ProfileUpdateIn(BaseModel):
@@ -89,7 +110,7 @@ async def update_profile(
     log.info(
         "profile_updated",
         user_id=str(user.id),
-        fields=[f for f in ("full_name", "email", "address", "latitude", "longitude")],
+        fields=["full_name", "email", "address", "latitude", "longitude"],
     )
     return ProfileOut(
         full_name=user.full_name,
