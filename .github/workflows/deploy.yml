@@ -21,9 +21,13 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v6
 
-      - name: Install dependencies
+      - name: Export production dependencies
         run: |
-          uv export --format requirements-txt --no-dev > requirements.txt
+          uv export \
+            --format requirements-txt \
+            --no-dev \
+            --no-emit-project \
+            > requirements.txt
 
       - name: Build Lambda package
         run: |
@@ -31,8 +35,12 @@ jobs:
           mkdir lambda-package
 
           pip install \
-            --requirement requirements.txt \
-            --target lambda-package
+            --platform manylinux2014_x86_64 \
+            --implementation cp \
+            --python-version 3.13 \
+            --only-binary=:all: \
+            --target lambda-package \
+            -r requirements.txt
 
           cp -r app lambda-package/
 
