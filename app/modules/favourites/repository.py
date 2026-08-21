@@ -85,7 +85,7 @@ class FavouriteRepository:
         offset: int,
     ) -> tuple[list[Favourite], int]:
         count_subq = base.order_by(None).subquery()
-        total = await self.db.scalar(select(1).select_from(count_subq).count())
+        total = await self.db.scalar(select(func.count()).select_from(count_subq))
         # Re-run with order and pagination
         ordered = base.order_by(Favourite.created_at.desc(), Favourite.id)
         result = await self.db.execute(ordered.limit(limit).offset(offset))

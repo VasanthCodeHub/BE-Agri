@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from sqlalchemy import Select, select, update
+from sqlalchemy import Select, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import utc_now
@@ -106,7 +106,7 @@ class NotificationRepository:
         offset: int,
     ) -> tuple[list[Notification], int]:
         count_subq = base.order_by(None).subquery()
-        total = await self.db.scalar(select(1).select_from(count_subq).count())
+        total = await self.db.scalar(select(func.count()).select_from(count_subq))
         ordered = base.order_by(Notification.created_at.desc(), Notification.id)
         result = await self.db.execute(ordered.limit(limit).offset(offset))
         items = list(result.scalars().unique().all())

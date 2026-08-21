@@ -39,14 +39,61 @@ from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy.dialects import postgresql
 
 revision: str = "b7c2d4e6f8a0"
 down_revision: str | None = "9f3b4d5e6f70"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
+# Shared enum types — declared once, referenced with create_type=False.
+# These types are created by the earlier migration (4d996dee3993).
+# We re-declare them here with create_type=False so this migration can
+# reference them without asking PostgreSQL to CREATE TYPE again.
+# checkfirst=True in upgrade() makes this safe even on a fresh database.
+fuel_type = postgresql.ENUM(
+    "DIESEL", "PETROL", "ELECTRIC", "CNG", "HYBRID", name="fuel_type", create_type=False
+)
+transmission = postgresql.ENUM(
+    "MANUAL", "AUTOMATIC", "HYDROSTATIC", name="transmission", create_type=False
+)
+price_unit = postgresql.ENUM("HOUR", "DAY", "ACRE", "TRIP", name="price_unit", create_type=False)
+listing_status = postgresql.ENUM(
+    "DRAFT",
+    "PENDING_REVIEW",
+    "APPROVED",
+    "REJECTED",
+    "SUSPENDED",
+    name="listing_status",
+    create_type=False,
+)
+
+# Booking-related enums (dropped in upgrade, recreated in downgrade).
+booking_status = postgresql.ENUM(
+    "PENDING",
+    "ACCEPTED",
+    "ACTIVE",
+    "COMPLETED",
+    "REJECTED",
+    "CANCELLED",
+    name="booking_status",
+    create_type=False,
+)
+session_block = postgresql.ENUM(
+    "MORNING", "AFTERNOON", "EVENING", "FULL_DAY", name="session_block", create_type=False
+)
+
 
 def upgrade() -> None:
+    bind = op.get_bind()
+
+    # Ensure shared enum types exist (created by 4d996dee3993, but checkfirst
+    # makes this safe on a fresh database where that migration hasn't run yet).
+    fuel_type.create(bind, checkfirst=True)
+    transmission.create(bind, checkfirst=True)
+    price_unit.create(bind, checkfirst=True)
+    listing_status.create(bind, checkfirst=True)
+
     # --- Role: RENTER is now USER -----------------------------------------
     op.execute("ALTER TYPE user_role RENAME VALUE 'RENTER' TO 'USER'")
 
@@ -90,13 +137,7 @@ def upgrade() -> None:
         sa.Column("manufacturer_id", sa.UUID(), nullable=False),
         sa.Column("name", sa.String(length=80), nullable=False),
         sa.Column("vehicle_type_id", sa.UUID(), nullable=False),
-        sa.Column(
-            "fuel_type",
-            sa.Enum(
-                "DIESEL", "PETROL", "ELECTRIC", "CNG", "HYBRID", name="fuel_type", create_type=False
-            ),
-            nullable=False,
-        ),
+        sa.Column("fuel_type", fuel_type, nullable=False),
         sa.Column("power_hp", sa.Integer(), nullable=False),
         sa.Column("sort_order", sa.Integer(), server_default="100", nullable=False),
         sa.Column("is_active", sa.Boolean(), server_default="true", nullable=False),

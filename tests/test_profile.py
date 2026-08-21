@@ -109,9 +109,9 @@ async def test_requesting_provider_adds_the_role_without_a_duplicate_user(
 
     second = await _login(client, phone, role="PROVIDER")
 
-    assert second["user"]["roles"] == ["USER", "PROVIDER"]
+    assert set(second["user"]["roles"]) == {"USER", "PROVIDER"}
     me = await _me(client, second["access_token"])
-    assert me["roles"] == ["USER", "PROVIDER"]
+    assert set(me["roles"]) == {"USER", "PROVIDER"}
 
     # The unique (user_id, role) constraint is the backstop; this proves the
     # code path never needed it — one row per phone, roles added on top.

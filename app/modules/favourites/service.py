@@ -6,6 +6,7 @@ from app.core.config import Settings
 from app.core.logging import get_logger
 from app.modules.favourites.repository import FavouriteRepository
 from app.modules.favourites.schemas import FavouriteOut
+from app.modules.vehicles.schemas import VehicleCardOut
 
 log = get_logger(__name__)
 
@@ -39,4 +40,11 @@ class FavouriteService:
             limit=limit,
             offset=offset,
         )
-        return [FavouriteOut.model_validate(fav) for fav in items]
+        return [
+            FavouriteOut(
+                id=fav.id,
+                vehicle=VehicleCardOut.from_model(fav.vehicle, settings=self.settings),
+                created_at=fav.created_at.isoformat() if fav.created_at else "",
+            )
+            for fav in items
+        ]

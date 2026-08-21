@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from sqlalchemy import Select, select
+from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -78,7 +78,7 @@ class ReviewRepository:
         offset: int,
     ) -> tuple[list[Review], int]:
         count_subq = base.order_by(None).subquery()
-        total = await self.db.scalar(select(1).select_from(count_subq).count())
+        total = await self.db.scalar(select(func.count()).select_from(count_subq))
         ordered = base.order_by(Review.created_at.desc(), Review.id).limit(limit).offset(offset)
         result = await self.db.execute(ordered)
         items = list(result.scalars().unique().all())

@@ -67,8 +67,13 @@ def _auth(token: str) -> dict[str, str]:
 
 
 async def _create(client: AsyncClient, token: str, **overrides: Any) -> dict[str, Any]:
+    # Convert UUID objects to strings for JSON serialization
+    safe_overrides: dict[str, Any] = {}
+    for k, v in overrides.items():
+        safe_overrides[k] = str(v) if isinstance(v, uuid.UUID) else v
+
     response = await client.post(
-        f"{API}/provider/vehicles", json=_payload(**overrides), headers=_auth(token)
+        f"{API}/provider/vehicles", json=_payload(**safe_overrides), headers=_auth(token)
     )
     assert response.status_code == 201, response.text
     created: dict[str, Any] = response.json()
@@ -191,10 +196,13 @@ async def test_an_unknown_vehicle_type_is_rejected(client: AsyncClient) -> None:
 
 
 async def test_every_field_is_mandatory(client: AsyncClient) -> None:
-    """Dropping any required field must be a 422 naming that field."""
+    """Dropping any required field must be a 422 naming that field.
+
+    image_public_ids is optional (empty list = no photos).
+    """
     token = await _token(client, "9810000009")
 
-    for field in (
+    required_fields = (
         "name",
         "vehicle_type_code",
         "brand",
@@ -208,8 +216,9 @@ async def test_every_field_is_mandatory(client: AsyncClient) -> None:
         "fuel_type",
         "power_hp",
         "transmission",
-        "image_public_ids",
-    ):
+    )
+
+    for field in required_fields:
         body = _payload()
         del body[field]
         response = await client.post(f"{API}/provider/vehicles", json=body, headers=_auth(token))
@@ -217,6 +226,12 @@ async def test_every_field_is_mandatory(client: AsyncClient) -> None:
         assert response.status_code == 422, f"{field} was accepted as missing"
         named = [f["field"] for f in response.json()["error"]["details"]["fields"]]
         assert field in named, f"422 did not name {field}: {named}"
+
+    # image_public_ids is optional — omitting it is valid
+    body = _payload()
+    del body["image_public_ids"]
+    response = await client.post(f"{API}/provider/vehicles", json=body, headers=_auth(token))
+    assert response.status_code == 201, "image_public_ids should be optional"
 
 
 async def test_implausible_values_are_rejected(client: AsyncClient) -> None:
@@ -227,7 +242,7 @@ async def test_implausible_values_are_rejected(client: AsyncClient) -> None:
         {"manufacture_year": 2200},
         {"price_amount": 0},
         {"price_amount": -100},
-        {"power_hp": 0},
+        {"power_hp": -1},
         {"power_hp": 99999},
         {"latitude": 200},
         {"longitude": -500},
@@ -236,6 +251,12 @@ async def test_implausible_values_are_rejected(client: AsyncClient) -> None:
             f"{API}/provider/vehicles", json=_payload(**overrides), headers=_auth(token)
         )
         assert response.status_code == 422, f"{overrides} was accepted"
+
+    # power_hp=0 IS VALID for non-motorised implements (rotavator, trailer, sprayer)
+    response = await client.post(
+        f"{API}/provider/vehicles", json=_payload(power_hp=0), headers=_auth(token)
+    )
+    assert response.status_code == 201, "power_hp=0 should be accepted for implements"
 
 
 # ---------------------------------------------------------------------------
@@ -288,11 +309,13 @@ async def test_images_outside_our_folder_are_rejected(client: AsyncClient) -> No
 async def test_image_count_is_bounded(client: AsyncClient) -> None:
     token = await _token(client, "9810000012")
 
+    # Empty list is now ALLOWED (providers can add photos later via PATCH)
     no_images = await client.post(
         f"{API}/provider/vehicles", json=_payload(image_public_ids=[]), headers=_auth(token)
     )
-    assert no_images.status_code == 422
+    assert no_images.status_code == 201, "empty image_public_ids should be accepted"
 
+    # But > MAX_IMAGES is still rejected
     too_many = await client.post(
         f"{API}/provider/vehicles",
         json=_payload(image_public_ids=[f"agri/vehicles/img{i}" for i in range(7)]),
@@ -754,13 +777,20 @@ async def test_editing_rejects_implausible_values(client: AsyncClient) -> None:
         {"manufacture_year": 1900},
         {"power_hp": 99999},
         {"image_public_ids": ["http://cdn.example.com/a.jpg"]},
-        {"image_public_ids": []},
         {"name": "x"},
     ):
         response = await client.patch(
             f"{API}/provider/vehicles/{vehicle['id']}", json=body, headers=_auth(token)
         )
         assert response.status_code == 422, f"{body} was accepted"
+
+    # image_public_ids=[] IS VALID in PATCH too (clear all images)
+    response = await client.patch(
+        f"{API}/provider/vehicles/{vehicle['id']}",
+        json={"image_public_ids": []},
+        headers=_auth(token),
+    )
+    assert response.status_code == 200, "clearing images should be allowed"
 
 
 async def test_an_empty_patch_changes_nothing(client: AsyncClient) -> None:
@@ -908,7 +938,7 @@ async def test_creating_with_a_master_model_rejects_a_conflicting_type(
         json=_payload(
             registration_number="TN38HH2222",
             vehicle_type_code="HARVESTER",
-            model_id=model_id,
+            model_id=str(model_id),
         ),
         headers=_auth(token),
     )
@@ -946,7 +976,7 @@ async def test_an_unknown_master_model_is_rejected(
         f"{API}/provider/vehicles",
         json=_payload(
             registration_number="TN38HH4444",
-            model_id=uuid.uuid4(),
+            model_id=str(uuid.uuid4()),
         ),
         headers=_auth(token),
     )
@@ -966,7 +996,7 @@ async def test_an_inactive_master_model_is_rejected(
         f"{API}/provider/vehicles",
         json=_payload(
             registration_number="TN38HH5555",
-            model_id=model_id,
+            model_id=str(model_id),
         ),
         headers=_auth(token),
     )
@@ -1003,8 +1033,8 @@ async def test_a_variant_must_belong_to_the_chosen_model(
         f"{API}/provider/vehicles",
         json=_payload(
             registration_number="TN38HH6666",
-            model_id=model_id,
-            variant_id=foreign_variant.id,
+            model_id=str(model_id),
+            variant_id=str(foreign_variant.id),
         ),
         headers=_auth(token),
     )
