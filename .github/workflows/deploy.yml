@@ -1,0 +1,55 @@
+name: Deploy Lambda
+
+on:
+  push:
+    branches:
+      - development
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Install dependencies
+        run: |
+          uv export --format requirements-txt --no-dev > requirements.txt
+
+      - name: Build Lambda package
+        run: |
+          rm -rf lambda-package
+          mkdir lambda-package
+
+          pip install \
+            --requirement requirements.txt \
+            --target lambda-package
+
+          cp -r app lambda-package/
+
+      - name: Create Lambda ZIP
+        run: |
+          cd lambda-package
+          zip -r ../lambda.zip .
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Deploy to Lambda
+        run: |
+          aws lambda update-function-code \
+            --function-name agri-backend \
+            --zip-file fileb://lambda.zip
